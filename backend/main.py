@@ -6,6 +6,9 @@ from pydantic import BaseModel
 
 load_dotenv()
 
+from fastmcp.server.http import create_streamable_http_app
+from mcp_server import mcp
+
 import asyncio
 from datetime import datetime, timezone
 
@@ -108,10 +111,16 @@ app = FastAPI(title="Agentic Cloud Assistant")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # Only allow our frontend
-    allow_methods=["GET", "POST"],  # POST added for /chat endpoint (Week 3)
-    allow_headers=["*"],  # Allow any headers
+    allow_origins=["http://localhost:5173"],
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["*"],
+    expose_headers=["mcp-session-id"],
 )
+
+# Mount the FastMCP server at /mcp.
+# streamable_http_path="/" so FastAPI's prefix-stripping lands at the right route.
+_mcp_asgi = create_streamable_http_app(mcp, streamable_http_path="/")
+app.mount("/mcp", _mcp_asgi)
 
 _AWS_AUTH_CODES = {
     "InvalidClientTokenId",
