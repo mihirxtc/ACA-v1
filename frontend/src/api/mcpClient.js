@@ -1,4 +1,4 @@
-const MCP_ENDPOINT = import.meta.env.VITE_MCP_URL ?? 'http://localhost:8000/mcp'
+const MCP_ENDPOINT = import.meta.env.VITE_MCP_URL ?? 'http://localhost:8000/mcp/'
 
 class MCPClient {
   constructor(endpoint) {

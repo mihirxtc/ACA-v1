@@ -1,14 +1,37 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-WORKDIR_BASE = Path("terraform_workdirs")
-EXECUTION_LOG = Path("execution_log.json")
+from filelock import FileLock
+
+_BACKEND_DIR = Path(__file__).parent.parent
+WORKDIR_BASE = _BACKEND_DIR / "terraform_workdirs"
+EXECUTION_LOG = _BACKEND_DIR / "execution_log.json"
+
+# File-level lock that serialises all read-modify-write operations on the log.
+# Two concurrent plan requests arriving at the same millisecond would otherwise
+# both read the same state, each append their entry, and the second write would
+# silently overwrite the first — losing the earlier execution record.
+_LOG_LOCK = FileLock(str(EXECUTION_LOG) + ".lock", timeout=10)
+
+
+def _build_env(aws_creds: dict | None) -> dict:
+    """Return an os.environ copy with AWS credentials injected if provided."""
+    env = os.environ.copy()
+    if aws_creds:
+        if aws_creds.get("aws_access_key_id"):
+            env["AWS_ACCESS_KEY_ID"] = aws_creds["aws_access_key_id"]
+        if aws_creds.get("aws_secret_access_key"):
+            env["AWS_SECRET_ACCESS_KEY"] = aws_creds["aws_secret_access_key"]
+        if aws_creds.get("aws_region"):
+            env["AWS_DEFAULT_REGION"] = aws_creds["aws_region"]
+    return env
 
 
 def create_execution_id() -> str:
@@ -49,7 +72,7 @@ def get_working_dir(execution_id: str) -> Path:
     return workdir
 
 
-def run_terraform_plan(hcl_config: str, execution_id: str) -> dict:
+def run_terraform_plan(hcl_config: str, execution_id: str, aws_creds: dict | None = None) -> dict:
     """
     Write HCL to a PERSISTENT working directory, then run:
       terraform init -backend=false
@@ -77,6 +100,7 @@ def run_terraform_plan(hcl_config: str, execution_id: str) -> dict:
     """
     try:
         workdir = get_working_dir(execution_id)
+        env = _build_env(aws_creds)
 
         tf_path = workdir / "main.tf"
         tf_path.write_text(hcl_config, encoding="utf-8")
@@ -87,6 +111,7 @@ def run_terraform_plan(hcl_config: str, execution_id: str) -> dict:
             text=True,
             cwd=workdir,
             timeout=60,
+            env=env,
         )
 
         if init_result.returncode != 0:
@@ -105,6 +130,7 @@ def run_terraform_plan(hcl_config: str, execution_id: str) -> dict:
             text=True,
             cwd=workdir,
             timeout=120,
+            env=env,
         )
 
         plan_output = plan_result.stdout + plan_result.stderr
@@ -135,7 +161,7 @@ def run_terraform_plan(hcl_config: str, execution_id: str) -> dict:
         }
 
 
-def run_terraform_apply(execution_id: str) -> dict:
+def run_terraform_apply(execution_id: str, aws_creds: dict | None = None) -> dict:
     """
     Apply the previously planned Terraform changes using the saved tfplan file.
 
@@ -170,6 +196,7 @@ def run_terraform_apply(execution_id: str) -> dict:
     try:
         workdir = get_working_dir(execution_id)
         tfplan = workdir / "tfplan"
+        env = _build_env(aws_creds)
 
         if not tfplan.exists():
             return {
@@ -187,14 +214,40 @@ def run_terraform_apply(execution_id: str) -> dict:
             text=True,
             cwd=workdir,
             timeout=300,
+            env=env,
         )
 
         apply_output = apply_result.stdout + apply_result.stderr
+        success = apply_result.returncode == 0
+
+        # Collect metadata for any .pem key files written by local_file resources.
+        # We return only the filename — NOT the key content — so that private key
+        # material is never embedded in an HTTP response body. Callers that need
+        # the key should call get_key_file(execution_id, filename) directly or
+        # use the GET /terraform/keys/{execution_id}/{filename} download endpoint.
+        key_files = []
+        if success:
+            for entry in workdir.iterdir():
+                if entry.suffix == ".pem" and entry.is_file():
+                    key_files.append({"name": entry.name})
+
+            # Remove the provider-plugin cache (.terraform/) and the consumed
+            # plan binary (tfplan) — together ~200MB per execution.
+            # main.tf and any .pem key files are kept: main.tf for audit
+            # trail, .pem files because the user may still need to download
+            # them via GET /terraform/keys/{execution_id}/{filename}.
+            plugin_dir = workdir / ".terraform"
+            if plugin_dir.exists():
+                shutil.rmtree(plugin_dir, ignore_errors=True)
+            tfplan_file = workdir / "tfplan"
+            if tfplan_file.exists():
+                tfplan_file.unlink(missing_ok=True)
 
         return {
-            "success": apply_result.returncode == 0,
+            "success": success,
             "apply_output": apply_output,
             "resources_applied": _parse_applied(apply_output),
+            "key_files": key_files,
         }
 
     except subprocess.TimeoutExpired:
@@ -211,48 +264,139 @@ def run_terraform_apply(execution_id: str) -> dict:
         }
 
 
+def run_terraform_destroy(execution_id: str, aws_creds: dict | None = None) -> dict:
+    """
+    Destroy resources created by a previous apply using the saved main.tf.
+
+    After apply, .terraform/ and tfplan are cleaned up but main.tf is kept.
+    This function re-runs terraform init then terraform destroy -auto-approve
+    so the user can roll back a completed execution from the UI.
+
+    Returns {"success": bool, "destroy_output": str}.
+    """
+    try:
+        workdir = get_working_dir(execution_id)
+        tf_path = workdir / "main.tf"
+        env = _build_env(aws_creds)
+
+        if not tf_path.exists():
+            return {
+                "success": False,
+                "destroy_output": f"No main.tf found for execution '{execution_id}'. Cannot destroy.",
+            }
+
+        init_result = subprocess.run(
+            ["terraform", "init", "-backend=false", "-no-color"],
+            capture_output=True, text=True, cwd=workdir, timeout=60, env=env,
+        )
+        if init_result.returncode != 0:
+            return {
+                "success": False,
+                "destroy_output": f"terraform init failed:\n{(init_result.stdout + init_result.stderr).strip()}",
+            }
+
+        destroy_result = subprocess.run(
+            ["terraform", "destroy", "-auto-approve", "-no-color"],
+            capture_output=True, text=True, cwd=workdir, timeout=300, env=env,
+        )
+        output  = destroy_result.stdout + destroy_result.stderr
+        success = destroy_result.returncode == 0
+
+        if success:
+            plugin_dir = workdir / ".terraform"
+            if plugin_dir.exists():
+                shutil.rmtree(plugin_dir, ignore_errors=True)
+
+        return {"success": success, "destroy_output": output}
+
+    except subprocess.TimeoutExpired:
+        return {"success": False, "destroy_output": "terraform destroy timed out after 300 seconds."}
+    except Exception as e:
+        return {"success": False, "destroy_output": f"Unexpected error during destroy: {str(e)}"}
+
+
+def get_key_file(execution_id: str, filename: str) -> bytes:
+    """
+    Read and return the raw bytes of a .pem key file for a given execution.
+
+    Security constraints enforced here:
+      - filename must not contain any path separator (prevents traversal like
+        '../../etc/passwd')
+      - filename must end with '.pem' (only key files served)
+      - the resolved path must be a direct child of the execution workdir
+        (double-checked after Path resolution to defeat symlink attacks)
+
+    Raises FileNotFoundError if the file does not exist.
+    Raises ValueError if the filename fails any security check.
+    """
+    if "/" in filename or "\\" in filename:
+        raise ValueError(f"Invalid filename: '{filename}'")
+    if not filename.endswith(".pem"):
+        raise ValueError("Only .pem files can be downloaded")
+
+    workdir = WORKDIR_BASE / execution_id
+    key_path = (workdir / filename).resolve()
+
+    # Ensure the resolved path is still inside the expected workdir
+    if workdir.resolve() not in key_path.parents:
+        raise ValueError("Path traversal detected")
+
+    if not key_path.exists():
+        raise FileNotFoundError(f"Key file '{filename}' not found for execution '{execution_id}'")
+
+    return key_path.read_bytes()
+
+
+def _read_log_unlocked() -> list:
+    """Read the log file without acquiring the lock (internal helper)."""
+    if not EXECUTION_LOG.exists():
+        return []
+    try:
+        return json.loads(EXECUTION_LOG.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
 def log_execution(entry: dict) -> None:
     """
     Append a new execution entry to the persistent execution log file.
 
     The log file is a JSON array stored at execution_log.json.
-    It grows indefinitely — acceptable for a dissertation demo.
-    In production you would rotate or archive log entries.
+    Uses a file lock to prevent concurrent writes from overwriting each other.
 
     Arguments:
-      entry — a dict matching the execution log schema (11 fields).
+      entry — a dict matching the execution log schema.
     """
-    history = get_execution_history()
-    history.append(entry)
-    EXECUTION_LOG.write_text(
-        json.dumps(history, indent=2, default=str),
-        encoding="utf-8",
-    )
+    with _LOG_LOCK:
+        history = _read_log_unlocked()
+        history.append(entry)
+        EXECUTION_LOG.write_text(
+            json.dumps(history, indent=2, default=str),
+            encoding="utf-8",
+        )
 
 
 def log_execution_update(execution_id: str, updates: dict) -> None:
     """
     Update an existing log entry in-place by execution_id.
 
-    Used to add the approval decision and apply result to an entry
-    that was created during the plan step.
-
-    If no matching entry is found, this function does nothing —
-    it never raises an exception.
+    Uses a file lock to prevent concurrent updates from overwriting each other.
+    If no matching entry is found, this function does nothing.
 
     Arguments:
       execution_id — the ID of the entry to update
       updates      — dict of fields to merge into the existing entry
     """
-    history = get_execution_history()
-    for entry in history:
-        if entry.get("execution_id") == execution_id:
-            entry.update(updates)
-            break
-    EXECUTION_LOG.write_text(
-        json.dumps(history, indent=2, default=str),
-        encoding="utf-8",
-    )
+    with _LOG_LOCK:
+        history = _read_log_unlocked()
+        for entry in history:
+            if entry.get("execution_id") == execution_id:
+                entry.update(updates)
+                break
+        EXECUTION_LOG.write_text(
+            json.dumps(history, indent=2, default=str),
+            encoding="utf-8",
+        )
 
 
 def get_execution_history() -> list:
@@ -309,4 +453,4 @@ def _parse_applied(output: str) -> list:
     Returns a list of resource address strings, e.g.:
       ["aws_s3_bucket.main", "aws_s3_bucket_versioning.main"]
     """
-    return re.findall(r"(\w+\.\w+): Creation complete", output)
+    return re.findall(r"([\w.]+): Creation complete", output)

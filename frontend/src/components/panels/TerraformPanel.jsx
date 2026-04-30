@@ -1,33 +1,147 @@
 import { useState, useEffect } from 'react'
 import { callTool } from '../../api/mcpClient'
-import { QUICK_REQUESTS, sleep } from '../../utils/constants'
+import { QUICK_REQUESTS } from '../../utils/constants'
 
-function ExecutionInline({ result }) {
-  const [phase,  setPhase]  = useState('plan')
-  const [output, setOutput] = useState('Initializing plan…')
+const PHASE_BADGE = {
+  planning:          ['blue',    'PLANNING'],
+  awaiting_approval: ['warning', 'AWAITING APPROVAL'],
+  applying:          ['blue',    'APPLYING'],
+  complete:          ['success', 'COMPLETE'],
+  failed:            ['error',   'FAILED'],
+  rejected:          ['muted',   'REJECTED'],
+}
+
+function ExecutionInline({ hcl, description, awsAccessKey, awsSecretKey, awsRegion, model, apiKey, onApplyComplete, onDone }) {
+  const [phase,        setPhase]        = useState('planning')
+  const [planOutput,   setPlanOutput]   = useState('')
+  const [applyOutput,  setApplyOutput]  = useState('')
+  const [executionId,  setExecutionId]  = useState(null)
+  const [error,        setError]        = useState(null)
+  const [keyFiles,     setKeyFiles]     = useState([])
+  const [verifying,    setVerifying]    = useState(false)
+  const [verifyResult, setVerifyResult] = useState(null)
+  const [rollingBack,  setRollingBack]  = useState(false)
+  const [rollbackDone, setRollbackDone] = useState(false)
+
+  const awsArgs = {
+    aws_access_key_id:     awsAccessKey || '',
+    aws_secret_access_key: awsSecretKey || '',
+    aws_region:            awsRegion    || 'us-east-1',
+  }
 
   useEffect(() => {
     let cancelled = false
     ;(async () => {
-      await sleep(900)
-      if (cancelled) return
-      setOutput(
-        `# terraform plan\nTerraform will perform the following actions:\n` +
-        `  + ${result?.resource_type?.split('+')[0]?.trim() || 'aws_resource'}\n\n` +
-        `Plan: 1 to add, 0 to change, 0 to destroy.`
-      )
-      setPhase('approve')
+      try {
+        const r = await callTool('run_terraform_plan_mcp', {
+          hcl_config:  hcl,
+          description: description || 'Terraform plan',
+          ...awsArgs,
+        })
+        if (cancelled) return
+        setPlanOutput(r.plan_output || '')
+        setExecutionId(r.execution_id)
+        setPhase(r.status === 'awaiting_approval' ? 'awaiting_approval' : 'failed')
+      } catch (e) {
+        if (!cancelled) {
+          setError(e.message)
+          setPhase('failed')
+        }
+      }
     })()
     return () => { cancelled = true }
   }, []) // eslint-disable-line
 
   const approve = async () => {
     setPhase('applying')
-    setOutput((o) => o + '\n\n# terraform apply\nApplying…')
-    await sleep(1200)
-    setOutput((o) => o + '\nApply complete! Resources: 1 added, 0 changed, 0 destroyed.')
-    setPhase('done')
+    try {
+      const r = await callTool('run_terraform_apply_mcp', {
+        execution_id: executionId,
+        approved:     true,
+        ...awsArgs,
+      })
+      setApplyOutput(r.apply_output || '')
+      if (r.key_files?.length) setKeyFiles(r.key_files)
+      const finalPhase = r.status === 'complete' ? 'complete' : 'failed'
+      setPhase(finalPhase)
+      if (finalPhase === 'complete') onApplyComplete?.()
+    } catch (e) {
+      setApplyOutput(e.message)
+      setPhase('failed')
+    }
   }
+
+  const downloadPem = (file) => {
+    const blob = new Blob([file.content], { type: 'text/plain' })
+    const url  = URL.createObjectURL(blob)
+    const a    = document.createElement('a')
+    a.href     = url
+    a.download = file.name
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const downloadReport = () => {
+    const report = {
+      generated_at: new Date().toISOString(),
+      execution_id: executionId,
+      status:       'complete',
+      description,
+      plan_output:  planOutput,
+      apply_output: applyOutput,
+    }
+    const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' })
+    const url  = URL.createObjectURL(blob)
+    const a    = document.createElement('a')
+    a.href     = url
+    a.download = `audit-${executionId || 'report'}.json`
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const rollback = async () => {
+    if (!window.confirm('This will destroy the AWS resources just created. Are you sure?')) return
+    setRollingBack(true)
+    try {
+      await callTool('rollback_execution', {
+        execution_id:          executionId,
+        aws_access_key_id:     awsAccessKey || '',
+        aws_secret_access_key: awsSecretKey || '',
+        aws_region:            awsRegion    || 'us-east-1',
+      })
+      setRollbackDone(true)
+    } catch { /* silent */ }
+    finally { setRollingBack(false) }
+  }
+
+  const verify = async () => {
+    setVerifying(true)
+    setVerifyResult(null)
+    try {
+      const r = await callTool('run_security_analysis_with_summary', { model: model || 'groq', api_key: apiKey || '' })
+      setVerifyResult({ count: r.total_findings })
+    } catch { /* silent */ }
+    finally { setVerifying(false) }
+  }
+
+  const reject = async () => {
+    try {
+      await callTool('run_terraform_apply_mcp', {
+        execution_id: executionId,
+        approved:     false,
+        ...awsArgs,
+      })
+    } catch { /* rejection is best-effort */ }
+    setPhase('rejected')
+  }
+
+  const [badgeColor, badgeLabel] = PHASE_BADGE[phase] ?? ['blue', phase.toUpperCase()]
+
+  const outputLines = [
+    planOutput  ? `# terraform plan\n${planOutput}`  : null,
+    phase === 'applying' && !applyOutput ? '# terraform apply\nApplying…' : null,
+    applyOutput ? `# terraform apply\n${applyOutput}` : null,
+  ].filter(Boolean).join('\n\n')
 
   return (
     <div style={{
@@ -36,23 +150,102 @@ function ExecutionInline({ result }) {
     }}>
       <div className="aca-row" style={{ justifyContent: 'space-between' }}>
         <span className="aca-panel-title">Execution</span>
-        <span className={'aca-badge ' + (phase === 'done' ? 'success' : phase === 'approve' ? 'warning' : 'blue')}>
-          {phase === 'plan' ? 'PLANNING' : phase === 'approve' ? 'AWAITING APPROVAL' :
-           phase === 'applying' ? 'APPLYING' : 'COMPLETE'}
-        </span>
+        <span className={'aca-badge ' + badgeColor}>{badgeLabel}</span>
       </div>
-      <pre className="aca-code" style={{ maxHeight: 220, margin: 0 }}>{output}</pre>
-      {phase === 'approve' && (
+
+      {phase === 'planning' && (
+        <div style={{ color: 'var(--text-secondary)', fontSize: 13 }}>
+          Running terraform init + plan against AWS…
+        </div>
+      )}
+
+      {outputLines && (
+        <pre className="aca-code" style={{ maxHeight: 320, margin: 0 }}>{outputLines}</pre>
+      )}
+
+      {error && (
+        <div style={{ color: 'var(--error, #f87171)', fontSize: 13 }}>{error}</div>
+      )}
+
+      {phase === 'awaiting_approval' && (
         <div className="aca-row" style={{ gap: 8 }}>
-          <button className="aca-btn-primary" onClick={approve}>Approve & Apply</button>
-          <button className="aca-btn-ghost small" onClick={() => setPhase('done')}>Reject</button>
+          <button className="aca-btn-primary" onClick={approve}>Approve &amp; Apply</button>
+          <button className="aca-btn-ghost small" onClick={reject}>Reject</button>
+        </div>
+      )}
+
+      {keyFiles.length > 0 && (
+        <div style={{
+          background: 'var(--warning-dim)', border: '1px solid var(--warning)',
+          borderRadius: 6, padding: '10px 14px',
+        }}>
+          <div style={{ color: 'var(--warning)', fontSize: 12, marginBottom: 8 }}>
+            SSH Private Key generated — download and store securely. This is the only time you can retrieve it.
+          </div>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            {keyFiles.map((f) => (
+              <button key={f.name} className="aca-btn-primary" onClick={() => downloadPem(f)}>
+                ↓ Download {f.name}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {(phase === 'complete' || phase === 'failed' || phase === 'rejected') && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {phase === 'complete' && (
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', borderTop: '1px solid var(--border)', paddingTop: 12 }}>
+              <button className="aca-btn-ghost small" onClick={verify} disabled={verifying}>
+                {verifying ? '…Scanning' : '🔄 Re-scan & Verify'}
+              </button>
+              <button className="aca-btn-ghost small" onClick={downloadReport}>
+                ⬇ Download Report
+              </button>
+              <button className="aca-btn-ghost small" onClick={() =>
+                document.getElementById('execution-history-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+              }>
+                📋 View History
+              </button>
+              {!rollbackDone && (
+                <button className="aca-btn-ghost small" onClick={rollback} disabled={rollingBack}
+                  style={{ color: 'var(--error)' }}>
+                  {rollingBack ? '…Rolling back' : '↩ Rollback'}
+                </button>
+              )}
+              <button className="aca-btn-ghost small" onClick={onDone}>↩ New Request</button>
+            </div>
+          )}
+          {phase !== 'complete' && (
+            <button className="aca-btn-ghost small" onClick={onDone}>↩ New Request</button>
+          )}
+          {rollbackDone && (
+            <div style={{
+              background: 'var(--warning-dim)', border: '1px solid var(--warning)',
+              borderRadius: 6, padding: '8px 12px', fontSize: 12, color: 'var(--warning)',
+            }}>
+              ↩ Rollback complete — created resources have been destroyed.
+            </div>
+          )}
+          {verifyResult && (
+            <div style={{
+              background: verifyResult.count === 0 ? 'var(--success-dim)' : 'var(--warning-dim)',
+              border:     `1px solid ${verifyResult.count === 0 ? 'var(--success)' : 'var(--warning)'}`,
+              borderRadius: 6, padding: '8px 12px', fontSize: 12,
+              color: verifyResult.count === 0 ? 'var(--success)' : 'var(--warning)',
+            }}>
+              {verifyResult.count === 0
+                ? '✓ Re-scan complete — 0 issues found.'
+                : `⚠ Re-scan found ${verifyResult.count} remaining issue(s).`}
+            </div>
+          )}
         </div>
       )}
     </div>
   )
 }
 
-export default function TerraformPanel({ model, apiKey, prefill, onPrefillConsumed }) {
+export default function TerraformPanel({ model, apiKey, awsAccessKey, awsSecretKey, awsRegion, prefill, onPrefillConsumed, onApplyComplete, }) {
   const [input,    setInput]    = useState('')
   const [loading,  setLoading]  = useState(false)
   const [result,   setResult]   = useState(null)
@@ -76,7 +269,14 @@ export default function TerraformPanel({ model, apiKey, prefill, onPrefillConsum
     setResult(null)
     setShowExec(false)
     try {
-      const r = await callTool('generate_terraform_from_request', { request, model, api_key: apiKey })
+      const r = await callTool('generate_terraform_from_request', {
+        request,
+        model,
+        api_key: apiKey,
+        aws_access_key_id:     awsAccessKey || '',
+        aws_secret_access_key: awsSecretKey || '',
+        aws_region:            awsRegion    || 'us-east-1',
+      })
       setResult(r)
     } finally { setLoading(false) }
   }
@@ -141,6 +341,26 @@ export default function TerraformPanel({ model, apiKey, prefill, onPrefillConsum
               <span style={{ color: 'var(--text-secondary)', fontSize: 12 }}>{result.description}</span>
             </div>
 
+            {result.error && (
+              <div style={{
+                background: 'var(--error-dim, rgba(255,68,68,0.08))', border: '1px solid var(--error, #f87171)',
+                borderRadius: 6, padding: '8px 12px', color: 'var(--error, #f87171)', fontSize: 12,
+                fontFamily: 'monospace', whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+              }}>
+                {result.error}
+              </div>
+            )}
+
+            {!result.error && result.validation && !result.validation.valid && result.validation.message && (
+              <div style={{
+                background: 'var(--error-dim, rgba(255,68,68,0.08))', border: '1px solid var(--error, #f87171)',
+                borderRadius: 6, padding: '8px 12px', color: 'var(--error, #f87171)', fontSize: 12,
+                fontFamily: 'monospace', whiteSpace: 'pre-wrap',
+              }}>
+                {result.validation.message}
+              </div>
+            )}
+
             {result.naming_note && (
               <div style={{
                 background: 'var(--warning-dim)', border: '1px solid var(--border)',
@@ -171,7 +391,15 @@ export default function TerraformPanel({ model, apiKey, prefill, onPrefillConsum
               </button>
             </div>
 
-            {showExec && <ExecutionInline result={result} />}
+            {showExec && (
+              <ExecutionInline
+                hcl={result.hcl} description={input}
+                awsAccessKey={awsAccessKey} awsSecretKey={awsSecretKey} awsRegion={awsRegion}
+                model={model} apiKey={apiKey}
+                onApplyComplete={onApplyComplete}
+                onDone={() => { setShowExec(false); setResult(null); setInput('') }}
+              />
+            )}
           </div>
         )}
       </div>

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { useAuth } from '../contexts/AuthContext'
 import { useApiKeys } from '../contexts/ApiKeyContext'
 import { computeHealthScore } from '../utils/scoring'
@@ -13,6 +13,8 @@ import ExecutionHistoryPanel from './panels/ExecutionHistoryPanel'
 import SecurityAgentPanel    from './panels/SecurityAgentPanel'
 import KnowledgeBasePanel    from './panels/KnowledgeBasePanel'
 
+const AUTO_REFRESH_MS = 90_000 // re-scan every 90 s once data is loaded
+
 export default function Dashboard({ onOpenSettings }) {
   const { keys }   = useApiKeys()
   const { logout } = useAuth()
@@ -25,6 +27,9 @@ export default function Dashboard({ onOpenSettings }) {
   const [costLoading,     setCostLoading]     = useState(false)
   const [prefill,         setPrefill]         = useState(null)
   const [securityScore,   setSecurityScore]   = useState(null)
+  const [lastRefresh,     setLastRefresh]     = useState(null)
+
+  const infraLoadingRef = useRef(false)
 
   const getApiKey = () => {
     if (keys.model === 'groq')      return keys.groq_key
@@ -32,11 +37,25 @@ export default function Dashboard({ onOpenSettings }) {
     return keys.ollama_url
   }
 
-  const runInfra = async () => {
+  const runInfra = useCallback(async () => {
+    if (infraLoadingRef.current) return
+    infraLoadingRef.current = true
     setInfraLoading(true)
-    try { setInfra(await callTool('full_aws_scan')) }
-    finally { setInfraLoading(false) }
-  }
+    try {
+      setInfra(await callTool('full_aws_scan'))
+      setLastRefresh(new Date())
+    } finally {
+      setInfraLoading(false)
+      infraLoadingRef.current = false
+    }
+  }, [])
+
+  // Auto-refresh every 90 s — but only after the first manual scan
+  useEffect(() => {
+    if (!infra) return
+    const id = setInterval(runInfra, AUTO_REFRESH_MS)
+    return () => clearInterval(id)
+  }, [infra, runInfra])
 
   const runSecurity = async () => {
     setSecurityLoading(true)
@@ -67,6 +86,30 @@ export default function Dashboard({ onOpenSettings }) {
     }, 50)
   }
 
+  // Direct AWS API fix for SSH_PORT_OPEN / RDP_PORT_OPEN — no Terraform needed.
+  // Calls ec2.revoke_security_group_ingress() to remove the 0.0.0.0/0 rule.
+  const onDirectFix = useCallback(async (finding) => {
+    const portMap = { SSH_PORT_OPEN: 22, RDP_PORT_OPEN: 3389 }
+    const port = portMap[finding.rule]
+    if (!port) throw new Error(`No direct fix available for rule ${finding.rule}`)
+    const result = await callTool('revoke_open_ingress_rule', {
+      sg_id:                 finding.resource_id,
+      port,
+      region:                keys.region            || 'us-east-1',
+      aws_access_key_id:     keys.aws_access_key    || '',
+      aws_secret_access_key: keys.aws_secret_key    || '',
+    })
+    if (!result.success) throw new Error(result.message)
+    // Re-scan security after a short delay so AWS state settles
+    setTimeout(runSecurity, 2500)
+    return result
+  }, [keys, runSecurity])
+
+  // Called by TerraformPanel / SecurityAgentPanel after a successful apply
+  const onInfraChanged = useCallback(() => {
+    setTimeout(runInfra, 3000) // brief delay so AWS state settles
+  }, [runInfra])
+
   const hasKeys = !!(keys.groq_key || keys.anthropic_key || keys.ollama_url)
 
   return (
@@ -79,19 +122,28 @@ export default function Dashboard({ onOpenSettings }) {
         hasKeys={hasKeys}
       />
       <div className="aca-grid">
-        <InfrastructurePanel data={infra} loading={infraLoading} onScan={runInfra} />
-        <SecurityPanel data={security} loading={securityLoading} onScan={runSecurity} onFix={onFix} />
+        <InfrastructurePanel
+          data={infra} loading={infraLoading}
+          onScan={runInfra} lastRefresh={lastRefresh}
+        />
+        <SecurityPanel data={security} loading={securityLoading} onScan={runSecurity} onFix={onFix} onDirectFix={onDirectFix} />
         <CostPanel data={cost} loading={costLoading} onLoad={runCost} />
         <ChatPanel model={keys.model || 'groq'} apiKey={getApiKey()} />
         <TerraformPanel
           model={keys.model || 'groq'} apiKey={getApiKey()}
+          awsAccessKey={keys.aws_access_key} awsSecretKey={keys.aws_secret_key}
+          awsRegion={keys.region || 'us-east-1'}
           prefill={prefill} onPrefillConsumed={() => setPrefill(null)}
+          onApplyComplete={onInfraChanged}
         />
         <ExecutionHistoryPanel />
         <SecurityAgentPanel
           region={keys.region || 'us-east-1'}
           model={keys.model || 'groq'}
           apiKey={getApiKey()}
+          awsAccessKey={keys.aws_access_key}
+          awsSecretKey={keys.aws_secret_key}
+          onApplyComplete={onInfraChanged}
         />
         <KnowledgeBasePanel />
       </div>

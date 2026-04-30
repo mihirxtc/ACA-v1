@@ -1,0 +1,38 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    env_file:
+      - ./backend/.env
+    volumes:
+      - chroma_data:/app/chroma_db
+      - terraform_workdirs:/app/terraform_workdirs
+    # Not exposed to the host — Nginx proxies /mcp and /rag/ to it internally
+    expose:
+      - "8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # /mcp is a relative path — Nginx proxies it to backend:8000/mcp
+        VITE_MCP_URL: /mcp
+    ports:
+      - "80:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  chroma_data:
+  terraform_workdirs:

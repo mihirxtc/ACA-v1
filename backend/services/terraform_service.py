@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 
 import anthropic
+import httpx
 from groq import Groq
 
 # TERRAFORM_TOOL is still used by generate_terraform_with_anthropic to force
@@ -18,7 +19,7 @@ TERRAFORM_TOOL = {
         "properties": {
             "hcl": {
                 "type": "string",
-                "description": "Complete Terraform HCL code including terraform{}, provider{}, and resource blocks.",
+                "description": "Complete Terraform HCL including terraform{} with hashicorp/aws ~>5.0 AND hashicorp/random ~>3.0 providers, a random_id suffix resource, provider{}, variable{}, and all resource blocks. Every AWS resource name MUST include ${random_id.suffix.hex} to guarantee uniqueness.",
             },
             "resource_type": {
                 "type": "string",
@@ -37,14 +38,130 @@ TERRAFORM_TOOL = {
 SYSTEM_PROMPT = """\
 You are a Terraform expert that generates clean, valid AWS HCL configurations.
 
-Rules:
-- Always include a terraform {} block specifying required_providers hashicorp/aws ~> 5.0
-- Always include a provider "aws" {} block with a region variable (default = "us-east-1")
-- Use a variable "name_prefix" (default = "demo") to avoid resource name conflicts
+NAMING UNIQUENESS — CRITICAL:
+Every config MUST include the hashicorp/random provider and a random_id resource so that
+resource names are unique across multiple deployments of the same template:
+
+  terraform {
+    required_providers {
+      aws    = { source = "hashicorp/aws",    version = "~> 5.0" }
+      random = { source = "hashicorp/random", version = "~> 3.0" }
+    }
+  }
+
+  resource "random_id" "suffix" { byte_length = 4 }
+
+Append ${random_id.suffix.hex} to resource names that must be GLOBALLY UNIQUE in AWS
+(security group names within a VPC, S3 bucket names, IAM entity names, DB identifiers,
+key pair names). EC2 Name TAGS do not need the suffix — use the user's requested name
+exactly as the Name tag value.
+  tags = { Name = "mihir-server-1" }          # exact user-specified name in tag
+  name = "demo-sg-${random_id.suffix.hex}"    # suffix only on names that must be unique
+This prevents 400/409 "already exists" conflicts on every re-deploy.
+
+EC2 SSH KEY PAIR — when the request mentions SSH, port 22, or a key pair:
+ALWAYS generate a TLS key pair and save the private key locally using the tls provider:
+
+  terraform {
+    required_providers {
+      aws    = { source = "hashicorp/aws",    version = "~> 5.0" }
+      random = { source = "hashicorp/random", version = "~> 3.0" }
+      tls    = { source = "hashicorp/tls",    version = "~> 4.0" }
+    }
+  }
+
+  resource "tls_private_key" "ssh" {
+    algorithm = "RSA"
+    rsa_bits  = 4096
+  }
+
+  resource "aws_key_pair" "this" {
+    key_name   = "${var.name_prefix}-key-${random_id.suffix.hex}"
+    public_key = tls_private_key.ssh.public_key_openssh
+  }
+
+  resource "local_file" "private_key" {
+    content         = tls_private_key.ssh.private_key_pem
+    filename        = "${path.module}/${var.name_prefix}-key.pem"
+    file_permission = "0400"
+  }
+
+  # Then reference in the EC2 resource:
+  resource "aws_instance" "this" {
+    key_name = aws_key_pair.this.key_name
+    ...
+  }
+
+Add "local" = { source = "hashicorp/local", version = "~> 2.0" } to required_providers
+when using local_file.
+
+MY IP / SPECIFIC IP RESTRICTION — when the request says "from my IP" or "my IP only":
+Use a variable with a documentation-range default (RFC 5737 TEST-NET) so terraform plan
+succeeds AND the new rule is never a duplicate of an existing 0.0.0.0/0 rule:
+  variable "allowed_ssh_cidr" {
+    description = "CIDR for SSH access. REPLACE with your actual IP before applying, e.g. 203.0.113.45/32"
+    default     = "203.0.113.45/32"
+  }
+NEVER use default = "0.0.0.0/0" — it duplicates the vulnerable open rule and causes
+AWS to reject the apply with "duplicate Security Group rule" errors.
+Use ${var.allowed_ssh_cidr} in the security group ingress rule.
+
+Additional rules:
+- Always include a provider "aws" {} block with a variable "region" (default = "us-east-1")
+- Use a variable "name_prefix" (default = "demo")
 - Use descriptive, lowercase resource labels (e.g. "main", "this")
 - Do NOT include backend configuration
 - Do NOT hardcode AWS credentials or account IDs
-- Keep the config minimal but complete and immediately usable\
+- Keep the config minimal but complete and immediately usable
+- NEVER use data sources that query AWS at plan time (no data "aws_availability_zones",
+  data "aws_vpc", data "aws_subnets", data "aws_ami", etc.) — hardcode sensible defaults instead
+- For availability zones use literal strings: "${var.region}a" and "${var.region}b"
+- For EC2 security groups omit vpc_id to use the default VPC
+- For RDS: always create an aws_vpc + two aws_subnet resources (10.0.1.0/24 in <region>a,
+  10.0.2.0/24 in <region>b) and an aws_db_subnet_group referencing them inline
+- For VPC configs: hardcode CIDR blocks (10.0.0.0/16, subnets 10.0.x.0/24) and AZ literals
+- For IAM: use aws_iam_policy_document data source (it is local computation, not an AWS API call)
+- For S3 bucket names: AWS requires globally unique names — the random suffix is mandatory
+- For EBS storage: use root_block_device { volume_size = N, volume_type = "gp3" } inside the
+  aws_instance resource for the root volume. For additional volumes use aws_ebs_volume +
+  aws_volume_attachment.
+
+SECURITY GROUP RULE FIXES — CRITICAL:
+- `revoke_rules` is an argument on `aws_security_group` ONLY — NEVER place it inside
+  an `aws_security_group_rule` resource; it will cause "Unsupported argument" errors
+- To restrict SSH/port access on an existing security group: create a NEW
+  `aws_security_group_rule` resource with the restricted cidr_blocks and type = "ingress"
+- Never attempt to destroy or modify individual existing rules via Terraform without
+  first importing them — instead add the restrictive rule and note the open rule must
+  be removed manually
+- Correct pattern for SSH restriction fix:
+    resource "aws_security_group_rule" "restrict_ssh" {
+      type              = "ingress"
+      from_port         = 22
+      to_port           = 22
+      protocol          = "tcp"
+      cidr_blocks       = [var.allowed_ssh_cidr]   # must NOT be 0.0.0.0/0
+      security_group_id = "<existing-sg-id>"
+    }
+- The new rule CIDR must differ from existing rules — using 0.0.0.0/0 as the default
+  will cause AWS to reject the apply with "duplicate Security Group rule" errors
+- Always use the RFC 5737 TEST-NET default (203.0.113.45/32) so plan + apply succeed
+  and the user replaces it with their real IP before the apply matters
+
+EXISTING INFRASTRUCTURE AWARENESS — CRITICAL:
+When the user message contains an EXISTING_INFRA block, you MUST read it carefully and:
+1. If a suitable security group already exists, reference its ID as a literal string instead
+   of creating a new aws_security_group resource.
+   Example: vpc_security_group_ids = ["sg-0abc123def456789a"]
+2. If a VPC already exists, use its ID as a literal string for vpc_id instead of creating
+   a new aws_vpc.
+   Example: vpc_id = "vpc-0abc123def456789a"
+3. If subnets already exist in the right AZs, use their IDs as literal strings instead of
+   creating new aws_subnet resources.
+   Example: subnet_ids = ["subnet-0abc123", "subnet-0def456"]
+4. If an IAM role already exists for the needed purpose, reference it by ARN or name.
+5. NEVER create an S3 bucket with the same name as one listed in EXISTING_INFRA.
+6. Only create new resources when nothing suitable already exists.\
 """
 
 
@@ -93,7 +210,7 @@ def validate_terraform_syntax(hcl: str) -> dict:
         }
 
 
-async def generate_terraform_with_anthropic(request: str, api_key: str) -> dict:
+async def generate_terraform_with_anthropic(request: str, api_key: str, existing_infra: str = "") -> dict:
     """
     Call Anthropic with tool_choice forced to "generate_terraform".
 
@@ -106,6 +223,10 @@ async def generate_terraform_with_anthropic(request: str, api_key: str) -> dict:
     key = api_key or os.getenv("ANTHROPIC_API_KEY", "")
     client = anthropic.Anthropic(api_key=key)
 
+    user_content = f"Generate Terraform HCL for: {request}"
+    if existing_infra:
+        user_content += f"\n\nEXISTING_INFRA:\n{existing_infra}"
+
     response = client.messages.create(
         model="claude-haiku-20240307",
         max_tokens=2048,
@@ -113,7 +234,7 @@ async def generate_terraform_with_anthropic(request: str, api_key: str) -> dict:
         tools=[TERRAFORM_TOOL],
         tool_choice={"type": "tool", "name": "generate_terraform"},
         messages=[
-            {"role": "user", "content": f"Generate Terraform HCL for: {request}"}
+            {"role": "user", "content": user_content}
         ],
     )
 
@@ -126,7 +247,7 @@ async def generate_terraform_with_anthropic(request: str, api_key: str) -> dict:
     )
 
 
-async def generate_terraform_with_groq(request: str, api_key: str) -> dict:
+async def generate_terraform_with_groq(request: str, api_key: str, existing_infra: str = "") -> dict:
     """
     Call Groq with response_format=json_object and an explicit JSON schema
     in the prompt to replicate structured output without native tool_choice.
@@ -137,11 +258,13 @@ async def generate_terraform_with_groq(request: str, api_key: str) -> dict:
     key = api_key or os.getenv("GROQ_API_KEY", "")
     client = Groq(api_key=key)
 
+    infra_section = f"\n\nEXISTING_INFRA:\n{existing_infra}" if existing_infra else ""
+
     # We ask for the HCL in a fenced block and the metadata as JSON separately.
     # This avoids the json_object mode failure caused by heavily-escaped HCL strings.
     prompt = f"""{SYSTEM_PROMPT}
 
-Generate Terraform HCL for: {request}
+Generate Terraform HCL for: {request}{infra_section}
 
 Reply in this exact format — no other text:
 
@@ -181,7 +304,61 @@ Reply in this exact format — no other text:
     }
 
 
-async def generate_terraform(request: str, model: str, api_key: str) -> dict:
+async def generate_terraform_with_ollama(request: str, api_key: str, existing_infra: str = "") -> dict:
+    """
+    Call a locally running Ollama instance to generate Terraform HCL.
+
+    Uses the /api/chat endpoint with the same structured prompt as Groq.
+    api_key holds the Ollama base URL (e.g. http://localhost:11434).
+    Falls back to localhost if api_key is empty.
+    """
+    base_url = (api_key or "http://localhost:11434").rstrip("/")
+
+    infra_section = f"\n\nEXISTING_INFRA:\n{existing_infra}" if existing_infra else ""
+
+    prompt = f"""{SYSTEM_PROMPT}
+
+Generate Terraform HCL for: {request}{infra_section}
+
+Reply in this exact format — no other text:
+
+```hcl
+<complete terraform HCL here>
+```
+
+```json
+{{
+  "resource_type": "<primary AWS resource type, e.g. aws_instance>",
+  "description": "<one-sentence plain-English description>"
+}}
+```"""
+
+    async with httpx.AsyncClient(timeout=180.0) as client:
+        response = await client.post(
+            f"{base_url}/api/chat",
+            json={
+                "model": "gpt-oss:120b-cloud",
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+            },
+        )
+        response.raise_for_status()
+        raw = response.json()["message"]["content"]
+
+    hcl_match = re.search(r"```hcl\s*(.*?)```", raw, re.DOTALL)
+    hcl = hcl_match.group(1).strip() if hcl_match else ""
+
+    json_match = re.search(r"```json\s*(\{.*?\})\s*```", raw, re.DOTALL)
+    meta = json.loads(json_match.group(1)) if json_match else {}
+
+    return {
+        "hcl": hcl,
+        "resource_type": meta.get("resource_type", "unknown"),
+        "description": meta.get("description", ""),
+    }
+
+
+async def generate_terraform(request: str, model: str, api_key: str, existing_infra: str = "") -> dict:
     """
     Route to the correct provider, then validate the generated HCL.
 
@@ -202,9 +379,11 @@ async def generate_terraform(request: str, model: str, api_key: str) -> dict:
     """
     try:
         if model == "anthropic":
-            result = await generate_terraform_with_anthropic(request, api_key)
+            result = await generate_terraform_with_anthropic(request, api_key, existing_infra)
+        elif model == "ollama":
+            result = await generate_terraform_with_ollama(request, api_key, existing_infra)
         else:
-            result = await generate_terraform_with_groq(request, api_key)
+            result = await generate_terraform_with_groq(request, api_key, existing_infra)
 
         validation = validate_terraform_syntax(result["hcl"])
         result["validation"] = validation
@@ -218,112 +397,6 @@ async def generate_terraform(request: str, model: str, api_key: str) -> dict:
             "description": "Generation failed.",
             "validation": {"valid": False, "message": str(e)},
             "error": str(e),
-        }
-
-
-def handle_generate_terraform(
-    hcl: str,
-    resource_type: str = "unknown",
-    description: str = "",
-) -> dict:
-    """
-    Passthrough handler for the generate_terraform tool.
-
-    The LLM has already produced the structured output (hcl, resource_type,
-    description) inside its tool_use block. This handler simply surfaces those
-    values as a plain dict so dispatch_tool has a uniform return path.
-
-    Returns {"hcl": str, "resource_type": str, "description": str}
-    """
-    return {
-        "hcl": hcl,
-        "resource_type": resource_type,
-        "description": description,
-    }
-
-
-def handle_run_terraform_plan(
-    hcl_content: str,
-    resource_description: str = "",
-) -> dict:
-    """
-    Write HCL to a persistent temp directory, then run:
-      terraform init -backend=false -no-color
-      terraform plan  -no-color
-
-    Uses tempfile.mkdtemp() (not TemporaryDirectory) so the working directory
-    survives after the function returns — the caller may need its path, e.g.
-    to run terraform apply later with the saved plan binary.
-
-    Returns:
-      {
-        "success":      bool,   # True only if both init AND plan exit 0
-        "plan_output":  str,    # Combined stdout from plan (or init error)
-        "return_code":  int,    # Exit code of the last subprocess run
-        "working_dir":  str,    # Absolute path to the temp dir with main.tf
-      }
-
-    Never raises — all subprocess errors are captured and returned as
-    structured output so the agentic loop can handle them gracefully.
-    """
-    working_dir = tempfile.mkdtemp(prefix="aca_plan_")
-
-    try:
-        tf_path = os.path.join(working_dir, "main.tf")
-        with open(tf_path, "w") as f:
-            f.write(hcl_content)
-
-        init = subprocess.run(
-            ["terraform", "init", "-backend=false", "-no-color"],
-            cwd=working_dir,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if init.returncode != 0:
-            return {
-                "success": False,
-                "plan_output": f"terraform init failed:\n{(init.stderr or init.stdout).strip()}",
-                "return_code": init.returncode,
-                "working_dir": working_dir,
-            }
-
-        plan = subprocess.run(
-            ["terraform", "plan", "-no-color"],
-            cwd=working_dir,
-            capture_output=True,
-            text=True,
-            timeout=180,
-        )
-
-        plan_output = (plan.stdout or "").strip()
-        if plan.stderr:
-            plan_output = (
-                plan_output + "\n" + plan.stderr.strip()
-                if plan_output
-                else plan.stderr.strip()
-            )
-
-        return {
-            "success": plan.returncode == 0,
-            "plan_output": plan_output,
-            "return_code": plan.returncode,
-            "working_dir": working_dir,
-        }
-
-    except subprocess.TimeoutExpired as e:
-        return {
-            "success": False,
-            "plan_output": f"Terraform command timed out: {str(e)}",
-            "return_code": -1,
-            "working_dir": working_dir,
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "plan_output": f"Unexpected error during plan: {str(e)}",
-            "return_code": -1,
-            "working_dir": working_dir,
         }
 
 

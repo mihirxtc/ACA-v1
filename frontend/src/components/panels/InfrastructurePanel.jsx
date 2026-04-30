@@ -4,7 +4,7 @@ import {
 import { CHART_COLORS } from '../../utils/constants'
 import DarkTooltip from '../ui/DarkTooltip'
 
-export default function InfrastructurePanel({ data, loading, onScan }) {
+export default function InfrastructurePanel({ data, loading, onScan, lastRefresh }) {
   const tiles = data ? [
     { key: 'EC2', value: data.ec2?.count              ?? 0, color: CHART_COLORS.blue },
     { key: 'S3',  value: data.s3?.count               ?? 0, color: CHART_COLORS.success },
@@ -26,9 +26,16 @@ export default function InfrastructurePanel({ data, loading, onScan }) {
             </span>
           )}
         </div>
-        <button className="aca-btn-ghost small" onClick={onScan} disabled={loading}>
-          {loading ? 'Scanning…' : 'Refresh Scan'}
-        </button>
+        <div className="aca-row" style={{ gap: 10, alignItems: 'center' }}>
+          {lastRefresh && !loading && (
+            <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>
+              {lastRefresh.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+            </span>
+          )}
+          <button className="aca-btn-ghost small" onClick={onScan} disabled={loading}>
+            {loading ? 'Scanning…' : 'Refresh Scan'}
+          </button>
+        </div>
       </div>
       <div className="aca-panel-body">
         {!data && !loading && <div className="aca-empty">Run a scan to load infrastructure data</div>}

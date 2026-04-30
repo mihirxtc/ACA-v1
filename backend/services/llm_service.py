@@ -8,7 +8,7 @@ load_dotenv()
 
 
 async def chat_with_groq(
-    message: str, scan_data: dict, history: list = [], api_key: str = None
+    message: str, scan_data: dict, history: list = None, api_key: str = None
 ) -> str:
     """
     Send a message to the Groq cloud API using the llama-3.3-70b-versatile model.
@@ -32,6 +32,9 @@ async def chat_with_groq(
              something goes wrong (never raises an exception to the caller).
     """
 
+    if history is None:
+        history = []
+
     if api_key and api_key.strip():
         resolved_key = api_key.strip()
     else:
@@ -44,19 +47,33 @@ async def chat_with_groq(
         )
 
     system_prompt = (
-        "You are an expert AWS cloud management assistant.\n"
-        "You have complete visibility into the user's AWS infrastructure.\n"
-        "Here is the CURRENT state of their AWS account:\n"
+        "You are a friendly AWS cloud management assistant. "
+        "Answer the user's questions in plain, conversational English. "
+        "You have been given live data about their AWS account — use it to give accurate, specific answers.\n\n"
+        "AWS ACCOUNT DATA:\n"
         f"{json.dumps(scan_data, indent=2, default=str)}\n\n"
-        "Rules:\n"
-        "- Answer ONLY based on the data provided above\n"
-        "- Be specific — reference actual resource IDs and names\n"
-        "- If something is not in the data, say so clearly\n"
-        "- Be concise and helpful"
+        "DATA GUIDE — key fields to know:\n"
+        "- sg_usage.sg_usage: maps every security group ID to a list of attached resources. "
+        "An empty list means that security group is unused and safe to review for deletion.\n"
+        "- sg_usage.unused_sg_ids: pre-computed list of security group IDs with zero attached resources.\n"
+        "- sg_usage.unused_count: total number of unused security groups.\n"
+        "- ec2.instances[].security_group_ids: which SGs each EC2 instance uses.\n\n"
+        "STRICT RULES:\n"
+        "- Respond ONLY in natural English sentences — never paste JSON, code blocks, or raw data into your reply\n"
+        "- Be specific: mention counts, resource IDs, and names by extracting them from the data above\n"
+        "- Be concise — 1 to 4 sentences unless the user asks for detail\n"
+        "- If the data does not contain what they asked, say so plainly\n"
+        "- Never say 'According to the data' or quote field names like 'count' or 'status'"
     )
 
+    clean_history = [
+        {"role": m["role"], "content": m.get("content") or m.get("text", "")}
+        for m in history
+        if m.get("role") in ("user", "assistant")
+    ]
+
     messages = [{"role": "system", "content": system_prompt}]
-    messages = messages + history
+    messages = messages + clean_history
     messages.append({"role": "user", "content": message})
 
     try:
@@ -88,7 +105,7 @@ async def chat_with_groq(
 
 
 async def chat_with_ollama(
-    message: str, scan_data: dict, history: list = [], api_key: str = None
+    message: str, scan_data: dict, history: list = None, api_key: str = None
 ) -> str:
     """
     Send a message to a locally running Ollama instance using minimax-m2.7:cloud.
@@ -116,6 +133,9 @@ async def chat_with_ollama(
         ollama pull minimax-m2.7:cloud      ← download the model (~4 GB)
     """
 
+    if history is None:
+        history = []
+
     ec2 = scan_data.get("ec2", {})
     s3 = scan_data.get("s3", {})
     iam = scan_data.get("iam", {})
@@ -124,41 +144,70 @@ async def chat_with_ollama(
 
     ec2_summary = [
         {
-            "id": i.get("instance_id"),
+            "id": i.get("id") or i.get("instance_id"),
             "name": i.get("name"),
-            "type": i.get("instance_type"),
+            "type": i.get("type") or i.get("instance_type"),
             "state": i.get("state"),
+            "public_ip": i.get("public_ip"),
+            "private_ip": i.get("private_ip"),
+            "launch_time": i.get("launch_time"),
+            "security_groups": i.get("security_group_ids", []),
         }
         for i in ec2.get("instances", [])
     ]
 
+    s3_summary = [
+        {
+            "name": b.get("name"),
+            "is_public": b.get("is_public"),
+            "created": b.get("created"),
+        }
+        for b in s3.get("buckets", [])
+    ]
+
+    iam_summary = [
+        {
+            "username": u.get("username"),
+            "has_mfa": u.get("has_mfa"),
+            "last_login": u.get("last_login"),
+            "groups": u.get("groups", []),
+            "attached_policies": [p["name"] if isinstance(p, dict) else p for p in u.get("attached_policies", [])],
+            "inline_policies": u.get("inline_policies", []),
+            "access_keys": u.get("access_keys", []),
+        }
+        for u in iam.get("users", [])
+    ]
+
     sg_summary = [
         {
-            "id": sg.get("group_id"),
-            "name": sg.get("group_name"),
+            "id": sg.get("id") or sg.get("group_id"),
+            "name": sg.get("name") or sg.get("group_name"),
+            "vpc_id": sg.get("vpc_id"),
             "is_dangerous": sg.get("is_dangerous"),
+            "open_ports": sg.get("open_to_internet", []),
         }
         for sg in sgs.get("security_groups", [])
     ]
 
-    iam_summary = [
-        {"username": u.get("username"), "mfa_active": u.get("mfa_active")}
-        for u in iam.get("users", [])
-    ]
-
     vpc_summary = [
         {
-            "id": v.get("vpc_id"),
-            "cidr": v.get("cidr_block"),
+            "id": v.get("id") or v.get("vpc_id"),
+            "name": v.get("name"),
+            "cidr": v.get("cidr") or v.get("cidr_block"),
+            "is_default": v.get("is_default"),
+            "state": v.get("state"),
             "subnet_count": v.get("subnet_count"),
         }
         for v in vpc.get("vpcs", [])
     ]
 
+    sg_usage_data = scan_data.get("sg_usage", {})
+
     compact_summary = {
         "ec2_count": ec2.get("count", 0),
         "ec2_instances": ec2_summary,
         "s3_count": s3.get("count", 0),
+        "s3_buckets": s3_summary,
         "iam_user_count": iam.get("user_count", 0),
         "iam_users": iam_summary,
         "security_group_count": sgs.get("count", 0),
@@ -168,30 +217,45 @@ async def chat_with_ollama(
         "security_groups": sg_summary,
         "vpc_count": vpc.get("count", 0),
         "vpcs": vpc_summary,
+        "sg_usage": sg_usage_data,
     }
 
     system_prompt = (
-        "You are an expert AWS cloud management assistant.\n"
-        "You have complete visibility into the user's AWS infrastructure.\n"
-        "Here is the CURRENT state of their AWS account:\n"
+        "You are a friendly AWS cloud management assistant. "
+        "Answer the user's questions in plain, conversational English. "
+        "You have been given live data about their AWS account — use it to give accurate, specific answers.\n\n"
+        "AWS ACCOUNT DATA:\n"
         f"{json.dumps(compact_summary, indent=2, default=str)}\n\n"
-        "Rules:\n"
-        "- Answer ONLY based on the data provided above\n"
-        "- Be specific — reference actual resource IDs and names\n"
-        "- If something is not in the data, say so clearly\n"
-        "- Be concise and helpful"
+        "DATA GUIDE — key fields to know:\n"
+        "- sg_usage.sg_usage: maps every security group ID to a list of attached resources. "
+        "An empty list means that security group is unused and safe to review for deletion.\n"
+        "- sg_usage.unused_sg_ids: pre-computed list of security group IDs with zero attached resources.\n"
+        "- sg_usage.unused_count: total number of unused security groups.\n\n"
+        "STRICT RULES:\n"
+        "- Respond ONLY in natural English sentences — never paste JSON, code blocks, or raw data into your reply\n"
+        "- Be specific: mention counts, resource IDs, and names by extracting them from the data above\n"
+        "- Be concise — 1 to 4 sentences unless the user asks for detail\n"
+        "- If the data does not contain what they asked, say so plainly\n"
+        "- Never say 'According to the data' or quote field names like 'count' or 'status'"
     )
 
+    clean_history = [
+        {"role": m["role"], "content": m.get("content") or m.get("text", "")}
+        for m in history
+        if m.get("role") in ("user", "assistant")
+    ]
+
     messages = [{"role": "system", "content": system_prompt}]
-    messages = messages + history
+    messages = messages + clean_history
     messages.append({"role": "user", "content": message})
 
     try:
+        base_url = (api_key or "http://localhost:11434").rstrip("/")
         async with httpx.AsyncClient(timeout=180.0) as client:
             response = await client.post(
-                "http://localhost:11434/api/chat",
+                f"{base_url}/api/chat",
                 json={
-                    "model": "minimax-m2.7:cloud",
+                    "model": "gpt-oss:120b-cloud",
                     "messages": messages,
                     "stream": False,
                 },
@@ -221,8 +285,80 @@ async def chat_with_ollama(
         return f"Ollama error: {type(e).__name__}: {str(e)}"
 
 
+async def prompt_llm(prompt: str, model: str = "groq", api_key: str = "") -> str:
+    """
+    Send a single plain-text prompt to the configured LLM provider.
+
+    Unlike chat_with_groq/chat_with_anthropic, this function has NO system
+    prompt and NO scan data injection — intended for one-shot tasks such as
+    summarisation, RAG answer generation, and agent plan summaries where the
+    full context is already embedded inside the prompt string.
+
+    Parameters:
+        prompt   (str)  : Complete prompt to send to the LLM.
+        model    (str)  : Provider — "groq" (default), "anthropic", or "ollama".
+        api_key  (str)  : Optional key override. Falls back to .env variables.
+
+    Returns:
+        str: LLM reply text, or a plain-English error message (never raises).
+    """
+    key = api_key.strip() if api_key else None
+
+    if model == "anthropic":
+        resolved = key or os.getenv("ANTHROPIC_API_KEY", "")
+        if not resolved:
+            return "No Anthropic API key available."
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": resolved,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json={
+                        "model": "claude-haiku-4-5-20251001",
+                        "max_tokens": 1024,
+                        "messages": [{"role": "user", "content": prompt}],
+                    },
+                )
+                data = resp.json()
+                if resp.status_code != 200:
+                    return f"Anthropic error: {data.get('error', {}).get('message', str(data))}"
+                return data["content"][0]["text"]
+        except Exception as e:
+            return f"Error contacting Anthropic: {str(e)}"
+
+    else:  # groq (default)
+        resolved = key or os.getenv("GROQ_API_KEY", "")
+        if not resolved:
+            return "No Groq API key available."
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {resolved}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": "llama-3.3-70b-versatile",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.3,
+                        "max_tokens": 1024,
+                    },
+                )
+                data = resp.json()
+                if resp.status_code != 200:
+                    return f"Groq error: {data.get('error', {}).get('message', str(data))}"
+                return data["choices"][0]["message"]["content"]
+        except Exception as e:
+            return f"Error contacting Groq: {str(e)}"
+
+
 async def chat_with_anthropic(
-    message: str, scan_data: dict, history: list = [], api_key: str = None
+    message: str, scan_data: dict, history: list = None, api_key: str = None
 ) -> str:
     """
     Send a message to the Anthropic Claude API using claude-haiku-4-5.
@@ -248,6 +384,9 @@ async def chat_with_anthropic(
              something goes wrong (never raises an exception to the caller).
     """
 
+    if history is None:
+        history = []
+
     if api_key and api_key.strip():
         resolved_key = api_key.strip()
     else:
@@ -260,18 +399,32 @@ async def chat_with_anthropic(
         )
 
     system_prompt = (
-        "You are an expert AWS cloud management assistant.\n"
-        "You have complete visibility into the user's AWS infrastructure.\n"
-        "Here is the CURRENT state of their AWS account:\n"
+        "You are a friendly AWS cloud management assistant. "
+        "Answer the user's questions in plain, conversational English. "
+        "You have been given live data about their AWS account — use it to give accurate, specific answers.\n\n"
+        "AWS ACCOUNT DATA:\n"
         f"{json.dumps(scan_data, indent=2, default=str)}\n\n"
-        "Rules:\n"
-        "- Answer ONLY based on the data provided above\n"
-        "- Be specific — reference actual resource IDs and names\n"
-        "- If something is not in the data, say so clearly\n"
-        "- Be concise and helpful"
+        "DATA GUIDE — key fields to know:\n"
+        "- sg_usage.sg_usage: maps every security group ID to a list of attached resources. "
+        "An empty list means that security group is unused and safe to review for deletion.\n"
+        "- sg_usage.unused_sg_ids: pre-computed list of security group IDs with zero attached resources.\n"
+        "- sg_usage.unused_count: total number of unused security groups.\n"
+        "- ec2.instances[].security_group_ids: which SGs each EC2 instance uses.\n\n"
+        "STRICT RULES:\n"
+        "- Respond ONLY in natural English sentences — never paste JSON, code blocks, or raw data into your reply\n"
+        "- Be specific: mention counts, resource IDs, and names by extracting them from the data above\n"
+        "- Be concise — 1 to 4 sentences unless the user asks for detail\n"
+        "- If the data does not contain what they asked, say so plainly\n"
+        "- Never say 'According to the data' or quote field names like 'count' or 'status'"
     )
 
-    messages = list(history)
+    clean_history = [
+        {"role": m["role"], "content": m.get("content") or m.get("text", "")}
+        for m in history
+        if m.get("role") in ("user", "assistant")
+    ]
+
+    messages = list(clean_history)
     messages.append({"role": "user", "content": message})
 
     try:
