@@ -16,7 +16,6 @@ from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
-import httpx
 from fastmcp import FastMCP
 from fastmcp.server.http import create_streamable_http_app
 from starlette.middleware.cors import CORSMiddleware
@@ -30,6 +29,9 @@ from services.aws_scanner import (
     scan_s3,
     scan_security_groups,
     scan_vpc,
+    scan_existing_infra_for_context,
+    revoke_sg_ingress_rule,
+    scan_sg_usage,
 )
 from services.cost_analyzer import (
     detect_cost_anomaly,
@@ -43,72 +45,23 @@ from services.execution_service import (
     log_execution,
     log_execution_update,
     run_terraform_apply,
+    run_terraform_destroy,
     run_terraform_plan,
 )
 from services.llm_service import (
     chat_with_anthropic,
     chat_with_groq,
     chat_with_ollama,
+    prompt_llm,
 )
 from services.security_analyzer import run_security_analysis
-from services.terraform_service import generate_terraform, validate_terraform_syntax
+from services.terraform_service import (
+    generate_terraform,
+    handle_summarise_plan,
+    validate_terraform_syntax,
+)
 
 mcp = FastMCP("agentic-cloud-assistant")
-
-
-# =============================================================================
-# Internal helper — call an LLM with a plain prompt (no scan-data system prompt)
-# =============================================================================
-
-async def _llm(prompt: str, model: str = "groq", api_key: str = "") -> str:
-    """Send a single prompt to the configured LLM. Returns the reply string."""
-    key = api_key.strip() if api_key else None
-
-    if model == "anthropic":
-        resolved = key or os.getenv("ANTHROPIC_API_KEY", "")
-        if not resolved:
-            return "No Anthropic API key available."
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": resolved,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": "claude-haiku-4-5-20251001",
-                    "max_tokens": 1024,
-                    "messages": [{"role": "user", "content": prompt}],
-                },
-            )
-            data = resp.json()
-            if resp.status_code != 200:
-                return f"Anthropic error: {data.get('error', {}).get('message', str(data))}"
-            return data["content"][0]["text"]
-
-    else:  # groq (default)
-        resolved = key or os.getenv("GROQ_API_KEY", "")
-        if not resolved:
-            return "No Groq API key available."
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {resolved}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "llama-3.3-70b-versatile",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.3,
-                    "max_tokens": 1024,
-                },
-            )
-            data = resp.json()
-            if resp.status_code != 200:
-                return f"Groq error: {data.get('error', {}).get('message', str(data))}"
-            return data["choices"][0]["message"]["content"]
 
 
 # =============================================================================
@@ -214,6 +167,51 @@ def scan_vpc_detail(region: str = "us-east-1") -> dict:
 
 
 @mcp.tool()
+def scan_sg_usage_tool(
+    region: str = "us-east-1",
+    aws_access_key_id: str = "",
+    aws_secret_access_key: str = "",
+) -> dict:
+    """Map every security group to the resources currently attached to it.
+
+    Uses describe_network_interfaces() which covers ALL resource types:
+    EC2 instances, RDS databases, ALB/NLB load balancers, Lambda functions,
+    ECS tasks, and ElastiCache clusters — because every AWS service that uses
+    a security group does so through a Network Interface (ENI).
+
+    Useful for answering:
+      - Which security groups are not attached to any resource?
+      - What is using security group sg-0abc1234?
+      - Is it safe to delete sg-0def5678?
+
+    Args:
+        region:                AWS region to scan. Defaults to "us-east-1".
+        aws_access_key_id:     AWS access key (overrides env/profile if provided).
+        aws_secret_access_key: AWS secret key.
+
+    Returns:
+        {
+          "status":        "ok" | "error",
+          "total_count":   int,
+          "unused_count":  int,
+          "unused_sg_ids": [str],
+          "sg_usage": {
+            "<sg_id>": [
+              {"resource": str, "resource_type": str, "eni_id": str}
+            ]
+          }
+        }
+    """
+    credentials = {
+        "aws_access_key_id":     aws_access_key_id,
+        "aws_secret_access_key": aws_secret_access_key,
+        "aws_region":            region,
+    } if aws_access_key_id else None
+
+    return scan_sg_usage(region=region, credentials=credentials)
+
+
+@mcp.tool()
 def analyse_security_findings(scan_data: dict) -> dict:
     """Run 7 built-in security rules against raw AWS scan data.
 
@@ -284,7 +282,7 @@ async def run_security_analysis_with_summary(
                 indent=2,
             )
         )
-        llm_summary = await _llm(summary_prompt, model, api_key)
+        llm_summary = await prompt_llm(summary_prompt, model, api_key)
     else:
         llm_summary = "No security issues found. Your AWS infrastructure looks clean."
 
@@ -353,7 +351,7 @@ async def get_cost_with_summary(
         "provide 3-4 actionable recommendations in plain English:\n\n"
         + json.dumps(cost_summary, indent=2, default=str)
     )
-    llm_summary = await _llm(summary_prompt, model, api_key)
+    llm_summary = await prompt_llm(summary_prompt, model, api_key)
 
     return {
         "current_month": current_month,
@@ -404,31 +402,59 @@ async def generate_terraform_from_request(
     request: str,
     model: str = "groq",
     api_key: str = "",
+    aws_access_key_id: str = "",
+    aws_secret_access_key: str = "",
+    aws_region: str = "us-east-1",
 ) -> dict:
     """Generate Terraform HCL from a plain-English request string.
 
-    Equivalent to the old POST /terraform/generate endpoint. Accepts a
-    free-text description and returns structured HCL with validation result.
+    Scans existing AWS infrastructure first so the LLM can reference real
+    resource IDs (security groups, VPCs, subnets, IAM roles, S3 buckets)
+    instead of blindly creating duplicates.
 
     Args:
-        request: Plain-English description, e.g. "Create an EC2 t3.micro instance".
-        model:   LLM provider — "groq" (default) or "anthropic".
-        api_key: Optional API key override. Falls back to server .env keys.
+        request:               Plain-English description, e.g. "Create an EC2 t3.micro instance".
+        model:                 LLM provider — "groq" (default), "anthropic", or "ollama".
+        api_key:               Optional API key override. Falls back to server .env keys.
+        aws_access_key_id:     AWS access key for infrastructure context scan.
+        aws_secret_access_key: AWS secret key for infrastructure context scan.
+        aws_region:            AWS region to scan. Defaults to "us-east-1".
 
     Returns:
-        {"hcl", "validation": {"valid","message"}, "resource_type", "description", "error"}
+        {"hcl", "validation": {"valid","message"}, "resource_type", "description",
+         "error", "naming_note"}
     """
     resolved_model = model or ("anthropic" if os.getenv("ANTHROPIC_API_KEY") else "groq")
-    resolved_key = (
-        api_key.strip()
-        or (
-            os.getenv("ANTHROPIC_API_KEY")
-            if resolved_model == "anthropic"
-            else os.getenv("GROQ_API_KEY", "")
-        )
-    )
 
-    result = await generate_terraform(request, resolved_model, resolved_key)
+    if resolved_model == "ollama":
+        resolved_key = api_key.strip()
+    elif resolved_model == "anthropic":
+        resolved_key = api_key.strip() or os.getenv("ANTHROPIC_API_KEY", "")
+    else:
+        resolved_key = api_key.strip() or os.getenv("GROQ_API_KEY", "")
+
+    # Scan existing infra so the LLM knows what already exists
+    existing_infra = ""
+    if aws_access_key_id:
+        creds = {
+            "aws_access_key_id":     aws_access_key_id,
+            "aws_secret_access_key": aws_secret_access_key,
+            "aws_region":            aws_region,
+        }
+        try:
+            existing_infra = await asyncio.to_thread(
+                scan_existing_infra_for_context, aws_region, creds
+            )
+        except Exception:
+            existing_infra = ""
+
+    result = await generate_terraform(request, resolved_model, resolved_key, existing_infra)
+
+    naming_note = (
+        "Resource names include a random suffix to prevent deployment conflicts."
+        if result.get("hcl") and "random_id" in result.get("hcl", "")
+        else None
+    )
 
     return {
         "hcl": result.get("hcl", ""),
@@ -436,6 +462,7 @@ async def generate_terraform_from_request(
         "resource_type": result.get("resource_type", "unknown"),
         "description": result.get("description", ""),
         "error": result.get("error"),
+        "naming_note": naming_note,
     }
 
 
@@ -470,22 +497,36 @@ def validate_terraform_plan(hcl: str) -> dict:
 
 
 @mcp.tool()
-async def run_terraform_plan_mcp(hcl_config: str, description: str = "") -> dict:
+async def run_terraform_plan_mcp(
+    hcl_config: str,
+    description: str = "",
+    aws_access_key_id: str = "",
+    aws_secret_access_key: str = "",
+    aws_region: str = "us-east-1",
+) -> dict:
     """Write HCL to a persistent working directory, run terraform init + plan.
 
     Equivalent to the old POST /terraform/plan endpoint. READ-ONLY — never
     modifies AWS. Saves an execution_id for a subsequent apply call.
 
     Args:
-        hcl_config:  Complete Terraform HCL as a string.
-        description: Plain-English label for the execution log.
+        hcl_config:            Complete Terraform HCL as a string.
+        description:           Plain-English label for the execution log.
+        aws_access_key_id:     AWS access key (overrides env/profile if provided).
+        aws_secret_access_key: AWS secret key.
+        aws_region:            AWS region (default us-east-1).
 
     Returns:
         {"execution_id", "status": "awaiting_approval"|"plan_failed",
          "plan_output", "resources_to_add", "resources_to_change", "resources_to_destroy"}
     """
     execution_id = create_execution_id()
-    plan_result = await asyncio.to_thread(run_terraform_plan, hcl_config, execution_id)
+    aws_creds = {
+        "aws_access_key_id":     aws_access_key_id,
+        "aws_secret_access_key": aws_secret_access_key,
+        "aws_region":            aws_region,
+    } if aws_access_key_id else None
+    plan_result = await asyncio.to_thread(run_terraform_plan, hcl_config, execution_id, aws_creds)
 
     status = "awaiting_approval" if plan_result["success"] else "plan_failed"
     log_execution(
@@ -512,7 +553,13 @@ async def run_terraform_plan_mcp(hcl_config: str, description: str = "") -> dict
 
 
 @mcp.tool()
-def run_terraform_apply_mcp(execution_id: str, approved: bool) -> dict:
+def run_terraform_apply_mcp(
+    execution_id: str,
+    approved: bool,
+    aws_access_key_id: str = "",
+    aws_secret_access_key: str = "",
+    aws_region: str = "us-east-1",
+) -> dict:
     """Apply or reject a previously planned Terraform execution.
 
     Equivalent to the old POST /terraform/apply endpoint. The human-in-the-loop
@@ -520,8 +567,11 @@ def run_terraform_apply_mcp(execution_id: str, approved: bool) -> dict:
     touching AWS.
 
     Args:
-        execution_id: Must match the ID returned by run_terraform_plan_mcp.
-        approved:     True to apply; False to reject.
+        execution_id:          Must match the ID returned by run_terraform_plan_mcp.
+        approved:              True to apply; False to reject.
+        aws_access_key_id:     AWS access key (overrides env/profile if provided).
+        aws_secret_access_key: AWS secret key.
+        aws_region:            AWS region.
 
     Returns:
         {"status": "complete"|"failed"|"rejected",
@@ -531,7 +581,12 @@ def run_terraform_apply_mcp(execution_id: str, approved: bool) -> dict:
         log_execution_update(execution_id, {"status": "rejected"})
         return {"status": "rejected", "apply_output": "", "resources_applied": []}
 
-    apply_result = run_terraform_apply(execution_id)
+    aws_creds = {
+        "aws_access_key_id":     aws_access_key_id,
+        "aws_secret_access_key": aws_secret_access_key,
+        "aws_region":            aws_region,
+    } if aws_access_key_id else None
+    apply_result = run_terraform_apply(execution_id, aws_creds)
     status = "complete" if apply_result.get("success") else "failed"
     log_execution_update(
         execution_id,
@@ -545,6 +600,10 @@ def run_terraform_apply_mcp(execution_id: str, approved: bool) -> dict:
         "status": status,
         "apply_output": apply_result.get("apply_output", ""),
         "resources_applied": apply_result.get("resources_applied", []),
+        "key_files": [
+            {"name": kf["name"], "download_path": f"/terraform/keys/{execution_id}/{kf['name']}"}
+            for kf in apply_result.get("key_files", [])
+        ],
     }
 
 
@@ -558,6 +617,28 @@ def get_execution_history_tool() -> dict:
         {"executions": [...all log entries...]}
     """
     return {"executions": get_execution_history()}
+
+
+@mcp.tool()
+def summarise_plan_for_human(
+    plan_output: str,
+    issue_being_fixed: str,
+    risk_level: str = "medium",
+) -> dict:
+    """Parse raw terraform plan output and produce a plain-English approval summary.
+
+    Counts resources to add/change/destroy and generates a human-readable
+    description suitable for a non-expert to read before clicking Approve.
+
+    Args:
+        plan_output:       Raw stdout from terraform plan.
+        issue_being_fixed: Description of the security issue being addressed.
+        risk_level:        Estimated risk — "low", "medium", or "high".
+
+    Returns:
+        {"summary": str, "changes_count": int, "risk_level": str, "safe_to_approve": bool}
+    """
+    return handle_summarise_plan(plan_output, issue_being_fixed, risk_level)
 
 
 # =============================================================================
@@ -597,6 +678,10 @@ async def aws_chat(
         "iam": scan_iam(),
         "security_groups": scan_security_groups(region=region),
         "vpc": scan_vpc(region=region),
+        "cost_current_month": get_current_month_cost(),
+        "cost_monthly_trend": get_monthly_trend(months=3),
+        "cost_by_service": get_cost_by_service(),
+        "sg_usage": scan_sg_usage(region=region),
     }
 
     if model == "anthropic":
@@ -616,6 +701,8 @@ async def agent_run(
     region: str = "us-east-1",
     model: str = "groq",
     api_key: str = "",
+    aws_access_key_id: str = "",
+    aws_secret_access_key: str = "",
 ) -> dict:
     """Autonomous security remediation agent — scan, pick top issue, generate fix, plan.
 
@@ -628,9 +715,11 @@ async def agent_run(
       6. Generate a plain-English summary for human review
 
     Args:
-        region:  AWS region to scan. Defaults to "us-east-1".
-        model:   LLM provider — "groq" (default) or "anthropic".
-        api_key: Optional API key override. Falls back to server .env keys.
+        region:                AWS region to scan. Defaults to "us-east-1".
+        model:                 LLM provider — "groq" (default) or "anthropic".
+        api_key:               Optional API key override. Falls back to server .env keys.
+        aws_access_key_id:     AWS access key for scan + terraform (overrides env/profile).
+        aws_secret_access_key: AWS secret key.
 
     Returns:
         {"status": "awaiting_approval"|"no_issues"|"error",
@@ -638,13 +727,20 @@ async def agent_run(
          "resources_to_add", "resources_to_change", "resources_to_destroy",
          "summary", "error"}
     """
+    # Build credential dicts once — used for both scan and terraform
+    aws_creds = {
+        "aws_access_key_id":     aws_access_key_id,
+        "aws_secret_access_key": aws_secret_access_key,
+        "aws_region":            region,
+    } if aws_access_key_id else None
+
     # 1. Scan
     scan_data = {
-        "ec2": scan_ec2(region=region),
-        "s3": scan_s3(),
-        "iam": scan_iam(),
-        "security_groups": scan_security_groups(region=region),
-        "vpc": scan_vpc(region=region),
+        "ec2": scan_ec2(region=region, credentials=aws_creds),
+        "s3": scan_s3(credentials=aws_creds),
+        "iam": scan_iam(credentials=aws_creds),
+        "security_groups": scan_security_groups(region=region, credentials=aws_creds),
+        "vpc": scan_vpc(region=region, credentials=aws_creds),
     }
 
     # 2. Analyse
@@ -677,7 +773,7 @@ async def agent_run(
 
     # 5. Terraform plan (async thread so event loop isn't blocked)
     execution_id = create_execution_id()
-    plan_result = await asyncio.to_thread(run_terraform_plan, hcl, execution_id)
+    plan_result = await asyncio.to_thread(run_terraform_plan, hcl, execution_id, aws_creds)
 
     # 6. LLM summary for human review
     plan_snippet = plan_result.get("plan_output", "")[:2000]
@@ -691,7 +787,7 @@ async def agent_run(
         f"-{plan_result.get('resources_to_destroy',0)}\n\n"
         f"Plan:\n{plan_snippet}"
     )
-    summary = await _llm(summary_prompt, resolved_model, resolved_key)
+    summary = await prompt_llm(summary_prompt, resolved_model, resolved_key)
 
     # Log to execution history
     log_execution(
@@ -723,15 +819,24 @@ async def agent_run(
 
 
 @mcp.tool()
-def agent_approve(execution_id: str, approved: bool) -> dict:
+def agent_approve(
+    execution_id: str,
+    approved: bool,
+    aws_access_key_id: str = "",
+    aws_secret_access_key: str = "",
+    aws_region: str = "us-east-1",
+) -> dict:
     """Approve or reject an agent-generated Terraform plan.
 
     Replaces the old POST /agent/approve/{id} endpoint. If approved, applies
     the saved tfplan file. If rejected, logs the decision and returns.
 
     Args:
-        execution_id: ID returned by agent_run.
-        approved:     True to apply; False to reject.
+        execution_id:          ID returned by agent_run.
+        approved:              True to apply; False to reject.
+        aws_access_key_id:     AWS access key for terraform apply.
+        aws_secret_access_key: AWS secret key.
+        aws_region:            AWS region.
 
     Returns:
         {"status": "complete"|"failed"|"rejected",
@@ -747,7 +852,12 @@ def agent_approve(execution_id: str, approved: bool) -> dict:
         )
         return {"status": "rejected", "apply_output": "", "resources_applied": []}
 
-    apply_result = run_terraform_apply(execution_id)
+    aws_creds = {
+        "aws_access_key_id":     aws_access_key_id,
+        "aws_secret_access_key": aws_secret_access_key,
+        "aws_region":            aws_region,
+    } if aws_access_key_id else None
+    apply_result = run_terraform_apply(execution_id, aws_creds)
     status = "complete" if apply_result.get("success") else "failed"
     log_execution_update(
         execution_id,
@@ -763,6 +873,96 @@ def agent_approve(execution_id: str, approved: bool) -> dict:
         "apply_output": apply_result.get("apply_output", ""),
         "resources_applied": apply_result.get("resources_applied", []),
     }
+
+
+@mcp.tool()
+def revoke_open_ingress_rule(
+    sg_id: str,
+    port: int,
+    region: str = "us-east-1",
+    aws_access_key_id: str = "",
+    aws_secret_access_key: str = "",
+) -> dict:
+    """Revoke all 0.0.0.0/0 and ::/0 ingress rules for a specific port on a security group.
+
+    This is the correct direct fix for SSH_PORT_OPEN (port 22) and RDP_PORT_OPEN
+    (port 3389) findings. Terraform cannot remove individual rules from an existing
+    unmanaged security group — this tool calls ec2.revoke_security_group_ingress()
+    directly via the AWS SDK.
+
+    Args:
+        sg_id:                 Security group ID, e.g. "sg-0abc1234".
+        port:                  Port number to restrict, e.g. 22 or 3389.
+        region:                AWS region. Defaults to "us-east-1".
+        aws_access_key_id:     AWS access key.
+        aws_secret_access_key: AWS secret key.
+
+    Returns:
+        {"success": bool, "revoked": int, "message": str}
+    """
+    credentials = {
+        "aws_access_key_id":     aws_access_key_id,
+        "aws_secret_access_key": aws_secret_access_key,
+        "aws_region":            region,
+    } if aws_access_key_id else None
+
+    return revoke_sg_ingress_rule(sg_id, port, region, credentials)
+
+
+@mcp.tool()
+def mark_execution_resolved(execution_id: str) -> dict:
+    """Mark a security finding execution as manually resolved in the execution log.
+
+    Sets resolved=True and records the resolved_at timestamp. The entry remains
+    in the log for audit purposes — it is not deleted.
+
+    Args:
+        execution_id: ID of the execution to mark resolved.
+
+    Returns:
+        {"status": "resolved", "execution_id": str}
+    """
+    log_execution_update(execution_id, {
+        "resolved":    True,
+        "resolved_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return {"status": "resolved", "execution_id": execution_id}
+
+
+@mcp.tool()
+async def rollback_execution(
+    execution_id: str,
+    aws_access_key_id: str = "",
+    aws_secret_access_key: str = "",
+    aws_region: str = "us-east-1",
+) -> dict:
+    """Destroy resources created by a previous terraform apply (rollback).
+
+    Runs terraform init + destroy -auto-approve on the saved main.tf for the
+    given execution_id. Only safe to call on executions with status 'complete'.
+
+    Args:
+        execution_id:          ID returned by agent_run or run_terraform_plan_mcp.
+        aws_access_key_id:     AWS access key for terraform destroy.
+        aws_secret_access_key: AWS secret key.
+        aws_region:            AWS region.
+
+    Returns:
+        {"status": "rolled_back"|"rollback_failed", "destroy_output": str}
+    """
+    aws_creds = {
+        "aws_access_key_id":     aws_access_key_id,
+        "aws_secret_access_key": aws_secret_access_key,
+        "aws_region":            aws_region,
+    } if aws_access_key_id else None
+
+    result = await asyncio.to_thread(run_terraform_destroy, execution_id, aws_creds)
+    status = "rolled_back" if result["success"] else "rollback_failed"
+    log_execution_update(execution_id, {
+        "status":         status,
+        "destroy_output": result.get("destroy_output", ""),
+    })
+    return {"status": status, "destroy_output": result.get("destroy_output", "")}
 
 
 # =============================================================================
@@ -813,7 +1013,7 @@ async def rag_query_tool(
         resource_filter=resource_type or None,
     )
 
-    answer = await _llm(result["augmented_prompt"], model="groq", api_key=groq_key)
+    answer = await prompt_llm(result["augmented_prompt"], model="groq", api_key=groq_key)
 
     return {
         "answer": answer,

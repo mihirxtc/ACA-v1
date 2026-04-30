@@ -3,8 +3,11 @@ import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer } from 'recharts'
 import { CHART_COLORS } from '../../utils/constants'
 import DarkTooltip from '../ui/DarkTooltip'
 
-export default function SecurityPanel({ data, loading, onScan, onFix }) {
-  const [open, setOpen] = useState(null)
+const DIRECT_FIX_RULES = new Set(['SSH_PORT_OPEN', 'RDP_PORT_OPEN'])
+
+export default function SecurityPanel({ data, loading, onScan, onFix, onDirectFix }) {
+  const [open,            setOpen]            = useState(null)
+  const [directFixStatus, setDirectFixStatus] = useState({})
 
   const counts = useMemo(() => {
     if (!data) return null
@@ -12,6 +15,16 @@ export default function SecurityPanel({ data, loading, onScan, onFix }) {
     data.findings.forEach((f) => { c[f.severity] = (c[f.severity] || 0) + 1 })
     return c
   }, [data])
+
+  const handleDirectFix = async (f) => {
+    setDirectFixStatus(s => ({ ...s, [f.finding_id]: 'fixing' }))
+    try {
+      await onDirectFix(f)
+      setDirectFixStatus(s => ({ ...s, [f.finding_id]: 'done' }))
+    } catch (e) {
+      setDirectFixStatus(s => ({ ...s, [f.finding_id]: 'error:' + e.message }))
+    }
+  }
 
   const pieData = counts ? [
     { name: 'HIGH',   value: counts.HIGH,   color: CHART_COLORS.error },
@@ -109,8 +122,32 @@ export default function SecurityPanel({ data, loading, onScan, onFix }) {
                             <Fragment key={k}><dt>{k}</dt><dd>{v}</dd></Fragment>
                           ))}
                         </dl>
-                        <div>
-                          <button className="aca-btn-ghost small" onClick={() => onFix(f)}>Fix This →</button>
+                        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+                          {DIRECT_FIX_RULES.has(f.rule) && (
+                            <>
+                              {directFixStatus[f.finding_id] === 'done' ? (
+                                <span style={{ color: 'var(--success)', fontSize: 12 }}>
+                                  ✓ Open rule revoked — rescanning…
+                                </span>
+                              ) : directFixStatus[f.finding_id]?.startsWith('error:') ? (
+                                <span style={{ color: 'var(--error)', fontSize: 12 }}>
+                                  ✗ {directFixStatus[f.finding_id].slice(6)}
+                                </span>
+                              ) : (
+                                <button
+                                  className="aca-btn-primary"
+                                  style={{ fontSize: 12, padding: '4px 10px' }}
+                                  disabled={directFixStatus[f.finding_id] === 'fixing'}
+                                  onClick={() => handleDirectFix(f)}
+                                >
+                                  {directFixStatus[f.finding_id] === 'fixing' ? '…Revoking' : '⚡ Direct Fix'}
+                                </button>
+                              )}
+                            </>
+                          )}
+                          <button className="aca-btn-ghost small" onClick={() => onFix(f)}>
+                            Fix with Terraform →
+                          </button>
                         </div>
                       </div>
                     )}

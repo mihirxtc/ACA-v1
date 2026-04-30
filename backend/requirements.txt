@@ -11,3 +11,5 @@ sentence-transformers==2.7.0
 pypdf2==3.0.1
 python-multipart==0.0.9
 fastmcp
+filelock
+cachetools

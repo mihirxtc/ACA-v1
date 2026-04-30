@@ -37,14 +37,19 @@ function AgentPhaseSteps({ step, done = false }) {
   )
 }
 
-export default function SecurityAgentPanel({ region, model, apiKey }) {
-  const [phase,    setPhase]    = useState('idle')
-  const [step,     setStep]     = useState(0)
-  const [data,     setData]     = useState(null)
-  const [result,   setResult]   = useState(null)
-  const [showHcl,  setShowHcl]  = useState(false)
-  const [showPlan, setShowPlan] = useState(false)
-  const [error,    setError]    = useState(null)
+export default function SecurityAgentPanel({ region, model, apiKey, awsAccessKey, awsSecretKey, onApplyComplete }) {
+  const [phase,        setPhase]        = useState('idle')
+  const [step,         setStep]         = useState(0)
+  const [data,         setData]         = useState(null)
+  const [result,       setResult]       = useState(null)
+  const [showHcl,      setShowHcl]      = useState(false)
+  const [showPlan,     setShowPlan]     = useState(false)
+  const [error,        setError]        = useState(null)
+  const [verifying,    setVerifying]    = useState(false)
+  const [verifyResult, setVerifyResult] = useState(null)
+  const [rollingBack,  setRollingBack]  = useState(false)
+  const [rollbackDone, setRollbackDone] = useState(false)
+  const [resolved,     setResolved]     = useState(false)
 
   useEffect(() => {
     if (phase !== 'thinking' && phase !== 'applying') return
@@ -55,7 +60,11 @@ export default function SecurityAgentPanel({ region, model, apiKey }) {
   const run = async () => {
     setPhase('thinking'); setStep(0); setData(null); setResult(null); setError(null)
     try {
-      const r = await callTool('agent_run', { region, model, api_key: apiKey })
+      const r = await callTool('agent_run', {
+        region, model, api_key: apiKey,
+        aws_access_key_id:     awsAccessKey || '',
+        aws_secret_access_key: awsSecretKey || '',
+      })
       setData(r)
       setPhase(r.status === 'awaiting_approval' ? 'awaiting_approval' : 'idle')
     } catch (e) { setError(String(e)); setPhase('failed') }
@@ -64,15 +73,77 @@ export default function SecurityAgentPanel({ region, model, apiKey }) {
   const approve = async () => {
     setPhase('applying'); setStep(0)
     try {
-      const r = await callTool('agent_approve', { execution_id: data.execution_id, approved: true })
+      const r = await callTool('agent_approve', {
+        execution_id: data.execution_id, approved: true,
+        aws_access_key_id:     awsAccessKey || '',
+        aws_secret_access_key: awsSecretKey || '',
+        aws_region:            region        || 'us-east-1',
+      })
       setResult(r)
-      setPhase(r.status === 'complete' ? 'complete' : 'failed')
-      if (r.status !== 'complete') setError(r.error || 'Apply failed')
+      const finalPhase = r.status === 'complete' ? 'complete' : 'failed'
+      setPhase(finalPhase)
+      if (finalPhase === 'complete') onApplyComplete?.()
+      else setError(r.error || 'Apply failed')
     } catch (e) { setError(String(e)); setPhase('failed') }
   }
 
+  const downloadReport = () => {
+    const report = {
+      generated_at:  new Date().toISOString(),
+      execution_id:  data?.execution_id,
+      status:        'complete',
+      issue:         data?.issue,
+      summary:       data?.summary,
+      hcl:           data?.hcl,
+      plan_output:   data?.plan_output,
+      apply_output:  result?.apply_output,
+    }
+    const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' })
+    const url  = URL.createObjectURL(blob)
+    const a    = document.createElement('a')
+    a.href     = url
+    a.download = `audit-${data?.execution_id || 'report'}.json`
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const markResolved = async () => {
+    await callTool('mark_execution_resolved', { execution_id: data.execution_id }).catch(() => {})
+    setResolved(true)
+  }
+
+  const rollback = async () => {
+    if (!window.confirm('This will destroy the AWS resources just created. Are you sure?')) return
+    setRollingBack(true)
+    try {
+      await callTool('rollback_execution', {
+        execution_id:          data.execution_id,
+        aws_access_key_id:     awsAccessKey || '',
+        aws_secret_access_key: awsSecretKey || '',
+        aws_region:            region || 'us-east-1',
+      })
+      setRollbackDone(true)
+    } catch { /* silent */ }
+    finally { setRollingBack(false) }
+  }
+
+  const verify = async () => {
+    setVerifying(true)
+    setVerifyResult(null)
+    try {
+      const r = await callTool('run_security_analysis_with_summary', { model, api_key: apiKey })
+      setVerifyResult({ count: r.total_findings })
+    } catch { /* silent */ }
+    finally { setVerifying(false) }
+  }
+
   const reject = () => {
-    callTool('agent_approve', { execution_id: data.execution_id, approved: false }).catch(() => {})
+    callTool('agent_approve', {
+      execution_id: data.execution_id, approved: false,
+      aws_access_key_id:     awsAccessKey || '',
+      aws_secret_access_key: awsSecretKey || '',
+      aws_region:            region        || 'us-east-1',
+    }).catch(() => {})
     setPhase('idle'); setData(null)
   }
 
@@ -172,12 +243,62 @@ export default function SecurityAgentPanel({ region, model, apiKey }) {
             <pre className="aca-code" style={{ maxHeight: 260, margin: 0, color: 'var(--success)' }}>
               {result.apply_output}
             </pre>
-            <div>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', borderTop: '1px solid var(--border)', paddingTop: 12 }}>
+              <button className="aca-btn-ghost small" onClick={verify} disabled={verifying}>
+                {verifying ? '…Scanning' : '🔄 Re-scan & Verify'}
+              </button>
+              <button className="aca-btn-ghost small" onClick={downloadReport}>
+                ⬇ Download Report
+              </button>
+              <button className="aca-btn-ghost small" onClick={() =>
+                document.getElementById('execution-history-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+              }>
+                📋 View History
+              </button>
+              {!resolved && !rollbackDone && (
+                <button className="aca-btn-ghost small" onClick={markResolved}>
+                  ✓ Mark Resolved
+                </button>
+              )}
+              {!rollbackDone && (
+                <button className="aca-btn-ghost small" onClick={rollback} disabled={rollingBack}
+                  style={{ color: 'var(--error)' }}>
+                  {rollingBack ? '…Rolling back' : '↩ Rollback'}
+                </button>
+              )}
               <button className="aca-btn-ghost small"
-                onClick={() => { setPhase('idle'); setData(null); setResult(null) }}>
-                ↩ Run Again
+                onClick={() => { setPhase('idle'); setData(null); setResult(null); setVerifyResult(null); setRollbackDone(false); setResolved(false) }}>
+                ▶ Run Again
               </button>
             </div>
+            {resolved && (
+              <div style={{
+                background: 'var(--success-dim)', border: '1px solid var(--success)',
+                borderRadius: 6, padding: '8px 14px', fontSize: 12, color: 'var(--success)',
+              }}>
+                ✓ Marked as resolved — recorded in execution log.
+              </div>
+            )}
+            {rollbackDone && (
+              <div style={{
+                background: 'var(--warning-dim)', border: '1px solid var(--warning)',
+                borderRadius: 6, padding: '8px 14px', fontSize: 12, color: 'var(--warning)',
+              }}>
+                ↩ Rollback complete — created resources have been destroyed.
+              </div>
+            )}
+            {verifyResult && (
+              <div style={{
+                background: verifyResult.count === 0 ? 'var(--success-dim)' : 'var(--warning-dim)',
+                border:     `1px solid ${verifyResult.count === 0 ? 'var(--success)' : 'var(--warning)'}`,
+                borderRadius: 6, padding: '8px 14px', fontSize: 12,
+                color: verifyResult.count === 0 ? 'var(--success)' : 'var(--warning)',
+              }}>
+                {verifyResult.count === 0
+                  ? '✓ Re-scan complete — 0 security issues found. Fix confirmed.'
+                  : `⚠ Re-scan found ${verifyResult.count} remaining issue(s). Review the Security panel.`}
+              </div>
+            )}
           </div>
         )}
 

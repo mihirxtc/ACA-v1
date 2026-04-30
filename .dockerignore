@@ -1,0 +1,46 @@
+.git
+.github
+.idea
+.vscode
+.claude
+
+# Python
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/venv
+**/.venv
+
+# Frontend build artifacts and deps
+frontend/node_modules
+frontend/dist
+
+# Runtime data — mounted as Docker volumes instead
+backend/chroma_db
+chroma_db
+backend/terraform_workdirs
+backend/execution_log.json
+backend/benchmark_results.json
+
+# Dev/test artefacts — not needed in image
+backend/venv
+backend/.venv
+.venv
+backend/tests
+backend/benchmark.py
+backend/test.py
+backend/.pytest_cache
+backend/__pycache__
+
+# Secrets and private keys — never in image
+backend/.env
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/*.crt
+**/*.cer
+
+*.md
