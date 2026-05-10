@@ -1,0 +1,21 @@
+flowchart LR
+    USER(["User / Administrator"])
+    AWS(["AWS Cloud\nEC2 / S3 / IAM / VPC / Cost"])
+    LLM(["LLM Providers\nGroq · Anthropic · Ollama"])
+    CLAUDE(["Claude Desktop\n/ Claude Code"])
+
+    subgraph ACA["ACA-MCP System"]
+        CORE["Agentic Cloud Assistant\n(Agentic Cloud Assistant)"]
+    end
+
+    USER -- "AWS credentials\nqueries, approvals" --> ACA
+    ACA -- "findings, reports\nTerraform plans" --> USER
+
+    ACA -- "boto3 API calls" --> AWS
+    AWS -- "resource data\ncost data" --> ACA
+
+    ACA -- "prompts + context" --> LLM
+    LLM -- "HCL, summaries\nanalysis" --> ACA
+
+    CLAUDE -- "MCP tool calls\n(stdio / HTTP)" --> ACA
+    ACA -- "tool results" --> CLAUDE

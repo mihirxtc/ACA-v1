@@ -1,0 +1,54 @@
+flowchart TD
+    subgraph PRESENTATION["Presentation Layer — React 19 + Vite"]
+        Browser["Browser"]
+        P1["Infra Panel"] & P2["Security Panel"] & P3["Cost Panel"] & P4["Chat Panel"]
+        P5["Terraform Panel"] & P6["History Panel"] & P7["Agent Panel"] & P8["KB Panel"]
+        MCP_CLIENT["mcpClient.js\n(JSON-RPC 2.0 over SSE)"]
+    end
+
+    subgraph PROTOCOL["API / Protocol Layer"]
+        NGINX["Nginx (port 80)"]
+        MCP_HTTP["MCP HTTP/SSE (/mcp)"]
+        MCP_STDIO["MCP stdio (Claude Desktop)"]
+        REST["REST /tools/* (Swagger UI)"]
+    end
+
+    subgraph APPLICATION["Application Layer"]
+        FASTAPI["FastAPI (main.py)"]
+        FASTMCP["FastMCP Server\n(mcp_server.py — 40+ tools)"]
+    end
+
+    subgraph SERVICES["Services Layer"]
+        S1["aws_scanner.py"]
+        S2["security_analyzer.py"]
+        S3["llm_service.py"]
+        S4["terraform_service.py"]
+        S5["execution_service.py"]
+        S6["rag/rag_service.py"]
+        S7["agent_service.py"]
+    end
+
+    subgraph EXTERNAL["External Integrations"]
+        E1["AWS APIs (boto3)\nEC2 / S3 / IAM / Cost"]
+        E2["Terraform CLI v1.8.5"]
+        E3["Groq API\nLlama 3.3 70B"]
+        E4["Anthropic API\nClaude Opus 4.5"]
+        E5["Ollama (Local)"]
+        E6["ChromaDB\n(Vector Store)"]
+    end
+
+    Browser --> NGINX
+    MCP_CLIENT --> MCP_HTTP
+    NGINX --> MCP_HTTP & REST
+    MCP_HTTP --> FASTMCP
+    MCP_STDIO --> FASTMCP
+    REST --> FASTAPI
+    FASTAPI --> FASTMCP
+    FASTMCP --> S1 & S2 & S3 & S4 & S5 & S6 & S7
+    S1 --> E1
+    S2 --> S1
+    S3 --> E3 & E4 & E5
+    S4 --> E2 & S3
+    S5 --> E2 & E1
+    S6 --> E6
+    S7 --> S1 & S2 & S3 & S4 & S5

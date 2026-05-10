@@ -12,7 +12,7 @@ This file contains zero business logic.
 """
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
@@ -81,6 +81,52 @@ def download_key_file(execution_id: str, filename: str):
         raise HTTPException(status_code=400, detail=str(e))
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+
+try:
+    from rag.knowledge_base import knowledge_base as _knowledge_base
+    _RAG_AVAILABLE = True
+except Exception:
+    _RAG_AVAILABLE = False
+
+
+@app.post(
+    "/rag/documents/upload",
+    tags=["Knowledge Base"],
+    summary="Upload a PDF or plain-text file to the ChromaDB knowledge base",
+)
+async def upload_rag_document(
+    file: UploadFile = File(...),
+    doc_id: str = Form(...),
+    resource_type: str = Form("general"),
+):
+    """
+    Multipart file upload — cannot be an MCP tool parameter because MCP is JSON-only.
+    This mirrors the rag_upload_file MCP tool but accepts raw bytes via multipart/form-data.
+    """
+    if not _RAG_AVAILABLE:
+        raise HTTPException(status_code=503, detail="RAG knowledge base is not available.")
+    try:
+        content = await file.read()
+        if file.filename and file.filename.lower().endswith(".pdf"):
+            import io
+            import PyPDF2
+            pdf_reader = PyPDF2.PdfReader(io.BytesIO(content))
+            text = "\n\n".join(p.extract_text() or "" for p in pdf_reader.pages).strip()
+        else:
+            text = content.decode("utf-8", errors="ignore").strip()
+        if not text:
+            raise HTTPException(status_code=422, detail="No text could be extracted from the file.")
+        result = _knowledge_base.add_document(
+            doc_id=doc_id,
+            text=text,
+            metadata={"resource_type": resource_type, "filename": file.filename or ""},
+        )
+        return {"chunks_added": result.get("chunks_added", 0), "doc_id": doc_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":

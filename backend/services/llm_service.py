@@ -330,6 +330,26 @@ async def prompt_llm(prompt: str, model: str = "groq", api_key: str = "") -> str
         except Exception as e:
             return f"Error contacting Anthropic: {str(e)}"
 
+    elif model == "ollama":
+        base_url = (key or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")).rstrip("/")
+        try:
+            async with httpx.AsyncClient(timeout=180.0) as client:
+                resp = await client.post(
+                    f"{base_url}/api/chat",
+                    json={
+                        "model": "gpt-oss:120b-cloud",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "stream": False,
+                    },
+                )
+                if resp.status_code != 200:
+                    return f"Ollama error ({resp.status_code}): {resp.text}"
+                return resp.json()["message"]["content"]
+        except httpx.ConnectError:
+            return "Cannot connect to Ollama. Make sure Ollama is running (run: ollama serve)."
+        except Exception as e:
+            return f"Ollama error: {str(e)}"
+
     else:  # groq (default)
         resolved = key or os.getenv("GROQ_API_KEY", "")
         if not resolved:

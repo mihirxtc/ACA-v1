@@ -1,11 +1,4 @@
-import json
 from datetime import datetime, timezone
-
-from services.llm_service import (
-    chat_with_anthropic,
-    chat_with_groq,
-    chat_with_ollama,
-)
 
 SEVERITY_ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
 
@@ -528,63 +521,3 @@ def run_security_analysis(scan_data: dict) -> list:
     return sorted(all_findings, key=lambda f: SEVERITY_ORDER.get(f["severity"], 99))
 
 
-async def get_security_summary(
-    findings: list, model: str = "groq", api_key: str = None
-) -> str:
-    """
-    Pass security findings to an LLM and return a plain-English summary.
-
-    The findings list is embedded directly in the prompt so the LLM can
-    reference specific resource IDs, rule names, and severity levels in
-    its response. This is different from the /chat endpoint, where scan
-    data is injected into a generic system prompt — here the findings
-    are the entire context.
-
-    Parameters:
-        findings (list): The output of run_security_analysis() — a list
-                         of finding dicts sorted by severity.
-        model    (str) : Which LLM to use: "groq", "anthropic", or "ollama".
-                         Defaults to "groq".
-        api_key  (str) : Optional user-supplied API key. If None or empty,
-                         each LLM function will fall back to its .env key.
-
-    Returns:
-        str: A plain-English summary from the LLM, or a fallback string
-             if the LLM call fails or findings is empty.
-             Never raises an exception to the caller.
-    """
-
-    if not findings:
-        return (
-            "No security issues were found in the scanned AWS account. "
-            "The infrastructure appears to follow security best practices "
-            "for the rules checked."
-        )
-
-    prompt = f"""You are an AWS security expert reviewing findings \
-from an automated security scan.
-
-Here are the security findings:
-{json.dumps(findings, indent=2, default=str)}
-
-Please provide:
-1. A brief executive summary (2-3 sentences)
-2. The top 3 most critical issues to fix immediately
-3. A prioritised action list with specific steps
-
-Be concise, specific, and reference the actual resource IDs \
-and finding titles from the data above.
-Format your response clearly with numbered sections."""
-
-    try:
-        if model == "anthropic":
-            summary = await chat_with_anthropic(prompt, {}, [], api_key)
-        elif model == "ollama":
-            summary = await chat_with_ollama(prompt, {}, [], api_key)
-        else:
-            summary = await chat_with_groq(prompt, {}, [], api_key)
-
-        return summary
-
-    except Exception as e:
-        return f"Could not generate LLM summary: {str(e)}"

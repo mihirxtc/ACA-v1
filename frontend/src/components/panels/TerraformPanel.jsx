@@ -71,14 +71,21 @@ function ExecutionInline({ hcl, description, awsAccessKey, awsSecretKey, awsRegi
     }
   }
 
-  const downloadPem = (file) => {
-    const blob = new Blob([file.content], { type: 'text/plain' })
-    const url  = URL.createObjectURL(blob)
-    const a    = document.createElement('a')
-    a.href     = url
-    a.download = file.name
-    a.click()
-    URL.revokeObjectURL(url)
+  const downloadPem = async (file) => {
+    try {
+      const res = await fetch(file.download_path)
+      if (!res.ok) throw new Error(`Server returned ${res.status}`)
+      const text = await res.text()
+      const blob = new Blob([text], { type: 'application/x-pem-file' })
+      const url  = URL.createObjectURL(blob)
+      const a    = document.createElement('a')
+      a.href     = url
+      a.download = file.name
+      a.click()
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      alert(`Failed to download key file: ${e.message}`)
+    }
   }
 
   const downloadReport = () => {
