@@ -1,0 +1,58 @@
+flowchart LR
+    subgraph FRONTEND["Frontend — React 19"]
+        APP["App.jsx"]
+        AUTH["AuthContext\n(localStorage)"]
+        APIKEY["ApiKeyContext\n(localStorage)"]
+        DASH["Dashboard.jsx"]
+        subgraph PANELS["8 Dashboard Panels"]
+            P_I["Infrastructure"]
+            P_S["Security"]
+            P_C["Cost"]
+            P_CH["Chat"]
+            P_T["Terraform"]
+            P_H["History"]
+            P_A["Agent"]
+            P_K["Knowledge Base"]
+        end
+        CLIENT["mcpClient.js\nJSON-RPC 2.0 + SSE"]
+    end
+
+    subgraph IFACE["Interface"]
+        PROTO["MCP Protocol\nHTTP/SSE · stdio"]
+    end
+
+    subgraph BACKEND["Backend — FastAPI + FastMCP"]
+        MAIN["main.py\n(FastAPI entry)"]
+        SERVER["mcp_server.py\n(40+ MCP tools)"]
+        subgraph SVCS["Services"]
+            SV1["aws_scanner.py"]
+            SV2["security_analyzer.py"]
+            SV3["llm_service.py"]
+            SV4["terraform_service.py"]
+            SV5["execution_service.py"]
+            SV6["rag_service.py"]
+            SV7["agent_service.py"]
+        end
+        DOCS["docs_generator.py\n(/tools/* endpoints)"]
+    end
+
+    subgraph EXTERNAL["External"]
+        E1["AWS APIs\nboto3"]
+        E2["Terraform CLI"]
+        E3["Groq / Anthropic\n/ Ollama"]
+        E4["ChromaDB"]
+    end
+
+    APP --> AUTH & APIKEY & DASH
+    DASH --> PANELS
+    PANELS --> CLIENT
+    CLIENT --> PROTO
+    PROTO --> SERVER
+    SERVER --> MAIN
+    SERVER --> SVCS
+    MAIN --> DOCS
+    SV1 --> E1
+    SV3 --> E3
+    SV4 --> E2
+    SV5 --> E2 & E1
+    SV6 --> E4

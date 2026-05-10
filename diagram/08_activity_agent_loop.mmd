@@ -1,0 +1,25 @@
+flowchart TD
+    START([Start: User triggers Security Agent])
+
+    SCAN["Scan All AWS Resources\nEC2 · S3 · IAM · SG · VPC\n(concurrent boto3 calls)"]
+
+    ANALYSE["Run 7 Security Rules\nIdentify HIGH / MEDIUM / LOW findings"]
+
+    SELECT["Select Highest-Priority Finding\n(first HIGH, then MEDIUM, then LOW)"]
+
+    ITER{{"Iteration\n<= 6?"}}
+
+    GEN["Generate Terraform HCL\n(Claude Opus 4.5 via FastMCP Client)"]
+
+    VAL["Validate HCL Syntax\nterraform validate"]
+
+    PLAN["Run terraform plan\n(save binary tfplan)"]
+
+    SUMM["Summarise Plan\n(LLM converts raw output to plain English)"]
+
+    RETURN([Return Plan Summary to User\nNEVER auto-applies — human approval required])
+
+    START --> SCAN --> ANALYSE --> SELECT --> ITER
+    ITER -- YES --> GEN --> VAL --> PLAN --> SUMM
+    SUMM -- "increment iteration\nloop back" --> ITER
+    ITER -- "NO / max iterations reached\nor plan satisfactory" --> RETURN

@@ -1,18 +1,22 @@
 FROM python:3.11-slim
 
-# Install system deps: curl for health checks, gnupg for terraform repo
+# Install system deps: curl for health checks, unzip for Terraform
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
-    gnupg \
-    software-properties-common \
     unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Terraform (needed by terraform_service.py for plan/apply)
-RUN curl -fsSL https://releases.hashicorp.com/terraform/1.8.5/terraform_1.8.5_linux_amd64.zip \
-    -o /tmp/terraform.zip \
+# Install Terraform — detect CPU architecture so the build works on both
+# x86_64 (standard EC2) and arm64 (Graviton EC2 / Apple Silicon)
+RUN ARCH=$(dpkg --print-architecture) \
+    && if [ "$ARCH" = "amd64" ]; then TF_ARCH="amd64"; \
+       elif [ "$ARCH" = "arm64" ]; then TF_ARCH="arm64"; \
+       else echo "Unsupported architecture: $ARCH" && exit 1; fi \
+    && curl -fsSL https://releases.hashicorp.com/terraform/1.8.5/terraform_1.8.5_linux_${TF_ARCH}.zip \
+       -o /tmp/terraform.zip \
     && unzip /tmp/terraform.zip -d /usr/local/bin/ \
-    && rm /tmp/terraform.zip
+    && rm /tmp/terraform.zip \
+    && terraform version
 
 WORKDIR /app
 

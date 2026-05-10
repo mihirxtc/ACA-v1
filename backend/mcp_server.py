@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
+from cachetools import TTLCache
 from fastmcp import FastMCP
 from fastmcp.server.http import create_streamable_http_app
 from starlette.middleware.cors import CORSMiddleware
@@ -62,6 +63,19 @@ from services.terraform_service import (
 )
 
 mcp = FastMCP("agentic-cloud-assistant")
+
+# Keyed by region, refreshed every 5 minutes. Avoids re-scanning on every chat message.
+_SCAN_CACHE: TTLCache = TTLCache(maxsize=10, ttl=300)
+
+
+def _resolve_key(model: str, override: str) -> str:
+    """Return the API key to use: explicit override → env var fallback."""
+    key = (override or "").strip()
+    if key:
+        return key
+    if model == "anthropic":
+        return os.getenv("ANTHROPIC_API_KEY", "")
+    return os.getenv("GROQ_API_KEY", "")
 
 
 # =============================================================================
@@ -282,7 +296,7 @@ async def run_security_analysis_with_summary(
                 indent=2,
             )
         )
-        llm_summary = await prompt_llm(summary_prompt, model, api_key)
+        llm_summary = await prompt_llm(summary_prompt, model, _resolve_key(model, api_key))
     else:
         llm_summary = "No security issues found. Your AWS infrastructure looks clean."
 
@@ -351,7 +365,7 @@ async def get_cost_with_summary(
         "provide 3-4 actionable recommendations in plain English:\n\n"
         + json.dumps(cost_summary, indent=2, default=str)
     )
-    llm_summary = await prompt_llm(summary_prompt, model, api_key)
+    llm_summary = await prompt_llm(summary_prompt, model, _resolve_key(model, api_key))
 
     return {
         "current_month": current_month,
@@ -425,13 +439,7 @@ async def generate_terraform_from_request(
          "error", "naming_note"}
     """
     resolved_model = model or ("anthropic" if os.getenv("ANTHROPIC_API_KEY") else "groq")
-
-    if resolved_model == "ollama":
-        resolved_key = api_key.strip()
-    elif resolved_model == "anthropic":
-        resolved_key = api_key.strip() or os.getenv("ANTHROPIC_API_KEY", "")
-    else:
-        resolved_key = api_key.strip() or os.getenv("GROQ_API_KEY", "")
+    resolved_key = _resolve_key(resolved_model, api_key)
 
     # Scan existing infra so the LLM knows what already exists
     existing_infra = ""
@@ -670,19 +678,21 @@ async def aws_chat(
         {"reply": str}
     """
     history = history or []
-    resolved_key = api_key.strip() if api_key else None
+    resolved_key = _resolve_key(model, api_key)
 
-    scan_data = {
-        "ec2": scan_ec2(region=region),
-        "s3": scan_s3(),
-        "iam": scan_iam(),
-        "security_groups": scan_security_groups(region=region),
-        "vpc": scan_vpc(region=region),
-        "cost_current_month": get_current_month_cost(),
-        "cost_monthly_trend": get_monthly_trend(months=3),
-        "cost_by_service": get_cost_by_service(),
-        "sg_usage": scan_sg_usage(region=region),
-    }
+    if region not in _SCAN_CACHE:
+        _SCAN_CACHE[region] = {
+            "ec2": scan_ec2(region=region),
+            "s3": scan_s3(),
+            "iam": scan_iam(),
+            "security_groups": scan_security_groups(region=region),
+            "vpc": scan_vpc(region=region),
+            "cost_current_month": get_current_month_cost(),
+            "cost_monthly_trend": get_monthly_trend(months=3),
+            "cost_by_service": get_cost_by_service(),
+            "sg_usage": scan_sg_usage(region=region),
+        }
+    scan_data = _SCAN_CACHE[region]
 
     if model == "anthropic":
         key = resolved_key or os.getenv("ANTHROPIC_API_KEY")
@@ -757,13 +767,10 @@ async def agent_run(
         f"{issue['resource_type']} {issue['resource_id']}. "
         f"{issue['recommendation']}"
     )
-    resolved_model = model.strip() if model.strip() else (
+    resolved_model = (model or "").strip() or (
         "anthropic" if os.getenv("ANTHROPIC_API_KEY") else "groq"
     )
-    resolved_key = api_key.strip() or (
-        os.getenv("ANTHROPIC_API_KEY") if resolved_model == "anthropic"
-        else os.getenv("GROQ_API_KEY", "")
-    )
+    resolved_key = _resolve_key(resolved_model, api_key)
 
     terraform_result = await generate_terraform(fix_request, resolved_model, resolved_key)
     if terraform_result.get("error"):

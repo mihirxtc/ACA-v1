@@ -1,0 +1,23 @@
+stateDiagram-v2
+    [*] --> planned : run_terraform_plan_mcp called\n(execution_id created)
+
+    planned --> approval_pending : plan summary shown to user\n(Approve / Reject buttons rendered)
+
+    approval_pending --> approved : user clicks Approve
+    approval_pending --> rejected : user clicks Reject
+
+    rejected --> resolved : admin marks resolved
+
+    approved --> applying : run_terraform_apply_mcp called
+
+    applying --> applied : terraform apply succeeds
+    applying --> failed : terraform apply fails
+
+    applied --> rollback : user triggers destroy\n(run_terraform_destroy_mcp)
+    applied --> resolved : admin marks resolved\n(mark_execution_resolved)
+
+    rollback --> resolved : terraform destroy completes
+
+    failed --> resolved : admin marks resolved
+
+    resolved --> [*]

@@ -95,16 +95,42 @@ ALWAYS generate a TLS key pair and save the private key locally using the tls pr
 Add "local" = { source = "hashicorp/local", version = "~> 2.0" } to required_providers
 when using local_file.
 
-MY IP / SPECIFIC IP RESTRICTION — when the request says "from my IP" or "my IP only":
-Use a variable with a documentation-range default (RFC 5737 TEST-NET) so terraform plan
-succeeds AND the new rule is never a duplicate of an existing 0.0.0.0/0 rule:
+NEW EC2 INSTANCE WITH SSH — when creating a fresh EC2 instance with a NEW security group:
+  Use a variable for the SSH CIDR with default "0.0.0.0/0" so the instance is reachable,
+  AND always emit an output block reminding the user to lock it down:
+
+  variable "allowed_ssh_cidr" {
+    description = "CIDR allowed to SSH. Default 0.0.0.0/0 works for demos — restrict to your IP (run: curl ifconfig.me) for production."
+    default     = "0.0.0.0/0"
+  }
+
+  # In the security group ingress rule:
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [var.allowed_ssh_cidr]
+  }
+
+  # Always add this output so the user sees the security reminder in plan/apply output:
+  output "ssh_security_reminder" {
+    value = "SSH is open to ${var.allowed_ssh_cidr}. To restrict: set allowed_ssh_cidr=<your-ip>/32 (get your IP: curl ifconfig.me)"
+  }
+
+  203.0.113.45/32 is an RFC 5737 documentation-only IP that belongs to nobody — NEVER use it
+  for new EC2 instances because it will block all real SSH connections.
+
+MY IP / SPECIFIC IP RESTRICTION — ONLY when the user says "from my IP" or "my IP only"
+AND you are adding a rule to a PRE-EXISTING security group (not a newly created one):
+Use a variable with a documentation-range default so terraform plan succeeds AND the new
+rule is never a duplicate of the existing 0.0.0.0/0 rule already on that security group:
   variable "allowed_ssh_cidr" {
     description = "CIDR for SSH access. REPLACE with your actual IP before applying, e.g. 203.0.113.45/32"
     default     = "203.0.113.45/32"
   }
-NEVER use default = "0.0.0.0/0" — it duplicates the vulnerable open rule and causes
-AWS to reject the apply with "duplicate Security Group rule" errors.
-Use ${var.allowed_ssh_cidr} in the security group ingress rule.
+Do NOT use default = "0.0.0.0/0" in this specific case — it duplicates the existing open
+rule on the pre-existing SG and causes AWS to reject the apply with "duplicate Security
+Group rule" errors. Use ${var.allowed_ssh_cidr} in the ingress rule.
 
 Additional rules:
 - Always include a provider "aws" {} block with a variable "region" (default = "us-east-1")
@@ -143,10 +169,12 @@ SECURITY GROUP RULE FIXES — CRITICAL:
       cidr_blocks       = [var.allowed_ssh_cidr]   # must NOT be 0.0.0.0/0
       security_group_id = "<existing-sg-id>"
     }
-- The new rule CIDR must differ from existing rules — using 0.0.0.0/0 as the default
-  will cause AWS to reject the apply with "duplicate Security Group rule" errors
-- Always use the RFC 5737 TEST-NET default (203.0.113.45/32) so plan + apply succeed
-  and the user replaces it with their real IP before the apply matters
+- The new rule CIDR must differ from the existing open rule — using 0.0.0.0/0 would
+  duplicate the existing rule and cause AWS to reject with "duplicate Security Group rule"
+- Always use the RFC 5737 TEST-NET default (203.0.113.45/32) FOR SECURITY GROUP FIXES
+  so plan + apply succeed; the user then replaces it with their real IP
+- IMPORTANT: 203.0.113.45/32 is ONLY correct here (fixing an existing SG). For new EC2
+  instances use 0.0.0.0/0 so the instance is actually reachable.
 
 EXISTING INFRASTRUCTURE AWARENESS — CRITICAL:
 When the user message contains an EXISTING_INFRA block, you MUST read it carefully and:

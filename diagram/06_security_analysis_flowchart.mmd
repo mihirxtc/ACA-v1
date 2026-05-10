@@ -1,0 +1,28 @@
+flowchart TD
+    START([AWS Scan Results\nEC2 · S3 · IAM · SG · VPC])
+
+    subgraph HIGH_RULES["HIGH Severity Rules"]
+        R1["SSH port 22\nopen to 0.0.0.0/0"]
+        R2["RDP port 3389\nopen to 0.0.0.0/0"]
+        R3["S3 bucket\npublicly accessible"]
+        R4["Unrestricted all traffic\n(all ports, 0.0.0.0/0)"]
+    end
+
+    subgraph MED_LOW_RULES["MEDIUM / LOW Severity Rules"]
+        R5["IAM user\nwithout MFA\n(MEDIUM)"]
+        R6["Inactive IAM user\n90+ days no login\n(LOW)"]
+        R7["Default VPC\nin use\n(LOW)"]
+    end
+
+    AGG["Aggregate All Findings\n(sort: HIGH > MEDIUM > LOW)"]
+
+    SCORE["Health Score\n= 100 - (HIGH×3 + MEDIUM×2 + LOW×1)\nClamped to 0–100"]
+
+    OUT([Security Report\nFindings list + Health Score\ndisplayed on dashboard])
+
+    START --> R1 & R2 & R3 & R4
+    START --> R5 & R6 & R7
+    R1 & R2 & R3 & R4 --> AGG
+    R5 & R6 & R7 --> AGG
+    AGG --> SCORE
+    SCORE --> OUT

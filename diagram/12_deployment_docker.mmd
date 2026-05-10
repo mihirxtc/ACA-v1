@@ -1,0 +1,35 @@
+flowchart TD
+    BROWSER(["Browser (User)\nport 80"])
+
+    subgraph DC["Docker Compose — aca-network"]
+        subgraph NGINX_C["nginx container (frontend)"]
+            NGINX_IMG["Image: nginx:alpine (multi-stage)\nPort: 80:80 exposed"]
+            SPA["Serve React SPA\n/ → /usr/share/nginx/html"]
+            PROXY_MCP["Proxy /mcp → backend:8000\n(buffering off, timeout 300s)"]
+            PROXY_TOOLS["Proxy /tools/ /docs /terraform/\n→ backend:8000"]
+            PROXY_HEALTH["Proxy /health → backend:8000"]
+        end
+
+        subgraph BACKEND_C["backend container"]
+            BE_IMG["Image: python:3.11-slim\nPort: 8000 (internal only)"]
+            FASTAPI["FastAPI + FastMCP Server"]
+            TF_BIN["Terraform CLI v1.8.5\n(downloaded at build time)"]
+            SEVEN_SVC["7 Backend Services"]
+            HEALTHCHK["Health Check: curl /health\nevery 30s"]
+            VOL1[("Volume:\nchroma_data")]
+            VOL2[("Volume:\nterraform_workdirs")]
+        end
+    end
+
+    subgraph EXT["External Services"]
+        AWS["AWS APIs\n(boto3)"]
+        GROQ["Groq API"]
+        ANTHRO["Anthropic API"]
+        OLLAMA["Ollama (optional)"]
+    end
+
+    BROWSER -- "HTTP :80" --> NGINX_C
+    NGINX_C -- "proxy to :8000" --> BACKEND_C
+    BACKEND_C -- "boto3 HTTPS" --> AWS
+    BACKEND_C -- "HTTPS" --> GROQ & ANTHRO
+    BACKEND_C -.-> OLLAMA
