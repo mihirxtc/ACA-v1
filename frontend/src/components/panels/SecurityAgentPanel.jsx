@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { callTool } from '../../api/mcpClient'
+import { logEvent } from '../../lib/usageLog'
 import { AGENT_STEPS } from '../../utils/constants'
 
 function PhasePill({ phase }) {
@@ -65,6 +66,7 @@ export default function SecurityAgentPanel({ region, model, apiKey, awsAccessKey
         aws_access_key_id:     awsAccessKey || '',
         aws_secret_access_key: awsSecretKey || '',
       })
+      logEvent('agent_run', model, null)
       setData(r)
       setPhase(r.status === 'awaiting_approval' ? 'awaiting_approval' : 'idle')
     } catch (e) { setError(String(e)); setPhase('failed') }

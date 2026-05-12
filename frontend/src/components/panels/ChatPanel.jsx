@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { callTool } from '../../api/mcpClient'
+import { logEvent } from '../../lib/usageLog'
 
 export default function ChatPanel({ model, apiKey }) {
   const [messages, setMessages] = useState([])
@@ -21,6 +22,7 @@ export default function ChatPanel({ model, apiKey }) {
     try {
       const history = [...messages, newMsg].map((m) => ({ role: m.role, content: m.content }))
       const r = await callTool('aws_chat', { message: msg, model, api_key: apiKey, history })
+      logEvent('chat', model, null)
       setMessages((m) => [...m, { role: 'assistant', content: r.reply }])
     } finally { setLoading(false) }
   }

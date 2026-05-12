@@ -3,6 +3,7 @@ import { useAuth } from '../contexts/AuthContext'
 import { useApiKeys } from '../contexts/ApiKeyContext'
 import { computeHealthScore } from '../utils/scoring'
 import { callTool } from '../api/mcpClient'
+import { logEvent } from '../lib/usageLog'
 import Topbar                from './ui/Topbar'
 import InfrastructurePanel   from './panels/InfrastructurePanel'
 import SecurityPanel         from './panels/SecurityPanel'
@@ -64,6 +65,7 @@ export default function Dashboard({ onOpenSettings }) {
         model:   keys.model,
         api_key: getApiKey(),
       })
+      logEvent('security_analysis', keys.model, infra)
       setSecurity(d)
       setSecurityScore(computeHealthScore(d.findings))
     } finally { setSecurityLoading(false) }
@@ -72,10 +74,12 @@ export default function Dashboard({ onOpenSettings }) {
   const runCost = async () => {
     setCostLoading(true)
     try {
-      setCost(await callTool('get_cost_with_summary', {
+      const costData = await callTool('get_cost_with_summary', {
         model:   keys.model,
         api_key: getApiKey(),
-      }))
+      })
+      logEvent('cost_recommendation', keys.model, null)
+      setCost(costData)
     } finally { setCostLoading(false) }
   }
 

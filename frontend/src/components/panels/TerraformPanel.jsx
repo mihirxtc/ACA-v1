@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { callTool } from '../../api/mcpClient'
 import { QUICK_REQUESTS } from '../../utils/constants'
+import { logEvent } from '../../lib/usageLog'
 
 const PHASE_BADGE = {
   planning:          ['blue',    'PLANNING'],
@@ -284,6 +285,7 @@ export default function TerraformPanel({ model, apiKey, awsAccessKey, awsSecretK
         aws_secret_access_key: awsSecretKey || '',
         aws_region:            awsRegion    || 'us-east-1',
       })
+      logEvent('terraform_generation', model, null)
       setResult(r)
     } finally { setLoading(false) }
   }
