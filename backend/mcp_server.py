@@ -57,6 +57,7 @@ from services.llm_service import (
     prompt_llm,
 )
 from ollama_catalog import CLOUD_MODELS, DEFAULT_MODEL
+from usage_log import log_event, usage_summary
 from services.ollama_service import probe_ollama, stream_ollama_pull
 from services.security_analyzer import run_security_analysis
 from services.terraform_service import (
@@ -306,6 +307,11 @@ async def run_security_analysis_with_summary(
     else:
         llm_summary = "No security issues found. Your AWS infrastructure looks clean."
 
+    try:
+        log_event("security_analysis", ollama_model_name if model == "ollama" else model, scan_data)
+    except Exception:
+        pass
+
     return {
         "findings": findings,
         "severity_counts": counts,
@@ -373,6 +379,11 @@ async def get_cost_with_summary(
         + json.dumps(cost_summary, indent=2, default=str)
     )
     llm_summary = await prompt_llm(summary_prompt, model, _resolve_key(model, api_key), model_name=ollama_model_name)
+
+    try:
+        log_event("cost_recommendation", ollama_model_name if model == "ollama" else model, None)
+    except Exception:
+        pass
 
     return {
         "current_month": current_month,
@@ -470,6 +481,11 @@ async def generate_terraform_from_request(
         if result.get("hcl") and "random_id" in result.get("hcl", "")
         else None
     )
+
+    try:
+        log_event("terraform_generation", resolved_model, None)
+    except Exception:
+        pass
 
     return {
         "hcl": result.get("hcl", ""),
@@ -711,6 +727,11 @@ async def aws_chat(
         key = resolved_key or os.getenv("GROQ_API_KEY")
         reply = await chat_with_groq(message, scan_data, history, key)
 
+    try:
+        log_event("chat", ollama_model_name if model == "ollama" else model, scan_data)
+    except Exception:
+        pass
+
     return {"reply": reply}
 
 
@@ -820,6 +841,11 @@ async def agent_run(
             "resources_to_destroy": plan_result.get("resources_to_destroy", 0),
         }
     )
+
+    try:
+        log_event("agent_run", ollama_model_name if resolved_model == "ollama" else resolved_model, scan_data)
+    except Exception:
+        pass
 
     return {
         "status": "awaiting_approval",
@@ -1261,6 +1287,15 @@ def aws_cost_summary_resource(region: str) -> dict:
 # HTTP endpoints (multipart upload + Ollama REST — not expressible as MCP tools)
 # =============================================================================
 
+async def _usage_summary_endpoint(request: Request) -> JSONResponse:
+    """GET /api/usage/summary?window_hours=24"""
+    try:
+        window_hours = int(request.query_params.get("window_hours", "24"))
+    except (ValueError, TypeError):
+        window_hours = 24
+    return JSONResponse(usage_summary(window_hours=window_hours))
+
+
 async def _ollama_status_endpoint(request: Request) -> JSONResponse:
     """GET /api/ollama/status?base_url=..."""
     base_url = request.query_params.get("base_url", "http://localhost:11434")
@@ -1331,6 +1366,9 @@ def create_app():
     # Append extra routes to the existing Starlette router
     base_app.router.routes.append(
         Route("/rag/documents/upload", _upload_document_endpoint, methods=["POST"])
+    )
+    base_app.router.routes.append(
+        Route("/api/usage/summary", _usage_summary_endpoint, methods=["GET"])
     )
     base_app.router.routes.append(
         Route("/api/ollama/status", _ollama_status_endpoint, methods=["GET"])
