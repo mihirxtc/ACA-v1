@@ -1,0 +1,41 @@
+# Copy this file to terraform.tfvars and fill in your real values:
+#   cp terraform.tfvars.example terraform.tfvars
+#
+# terraform.tfvars is in .gitignore — never commit it (contains secrets)
+
+# ------------------------------------------------------------------
+# OCI Identity — get these from Oracle Cloud Console
+# ------------------------------------------------------------------
+
+# Profile (top-right) → Tenancy → copy OCID
+tenancy_ocid = "ocid1.tenancy.oc1..your_tenancy_ocid_here"
+
+# Profile (top-right) → My Profile → copy OCID
+user_ocid = "ocid1.user.oc1..your_user_ocid_here"
+
+# Same as tenancy_ocid for root compartment
+compartment_id = "ocid1.tenancy.oc1..your_tenancy_ocid_here"
+
+# From Profile → API Keys → fingerprint column (after creating API key)
+fingerprint = "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99"
+
+# Path to OCI API private key on your laptop (created in Profile → API Keys)
+private_key_path = "~/.oci/oci_api_key.pem"
+
+# ------------------------------------------------------------------
+# Region
+# ------------------------------------------------------------------
+region = "uk-london-1"
+
+# ------------------------------------------------------------------
+# SSH public key — paste contents of your .pub file here
+# ------------------------------------------------------------------
+ssh_public_key = "ssh-rsa AAAAB3NzaC1yc2E... your public key contents here"
+
+# ------------------------------------------------------------------
+# Availability Domain
+# 0 = AD-1, 1 = AD-2, 2 = AD-3
+# If you get "Out of host capacity", change this number and re-run:
+#   terraform apply
+# ------------------------------------------------------------------
+ad_number = 0
