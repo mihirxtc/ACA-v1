@@ -58,6 +58,7 @@ from services.llm_service import (
 )
 from ollama_catalog import CLOUD_MODELS, DEFAULT_MODEL
 from usage_log import log_event, usage_summary
+from ollama_recommender import RecommendContext, llm_explanation, recommend
 from services.ollama_service import probe_ollama, stream_ollama_pull
 from services.security_analyzer import run_security_analysis
 from services.terraform_service import (
@@ -1296,6 +1297,69 @@ async def _usage_summary_endpoint(request: Request) -> JSONResponse:
     return JSONResponse(usage_summary(window_hours=window_hours))
 
 
+async def _ollama_recommend_endpoint(request: Request) -> JSONResponse:
+    """POST /api/ollama/recommend — ranked model recommendations with explanations."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+
+    primary_use = body.get("primary_use", "chat")
+    latency_pref = body.get("latency_pref", "balanced")
+    scan_size_bucket = body.get("current_scan_size_bucket", "none")
+    anthropic_key = body.get("anthropic_key") or None
+    groq_key = body.get("groq_key") or None
+
+    summary = usage_summary()
+    context = RecommendContext(
+        primary_use=primary_use,
+        latency_pref=latency_pref,
+        scan_size_bucket=scan_size_bucket,
+        dominant_recent_action=summary.get("dominant_action"),
+        history_event_count=summary.get("total_events", 0),
+    )
+
+    catalog_ids = [m["id"] for m in CLOUD_MODELS]
+    ranked = recommend(context, catalog_ids)
+
+    explanations = await asyncio.gather(
+        *[llm_explanation(r, context, anthropic_key, groq_key) for r in ranked],
+        return_exceptions=True,
+    )
+
+    recs_out = []
+    for rec, expl in zip(ranked, explanations):
+        if isinstance(expl, Exception):
+            expl = rec.template_explanation
+            expl_source = "template"
+        else:
+            expl_source = "llm" if (anthropic_key or groq_key) else "template"
+
+        top_features = sorted(
+            rec.feature_breakdown, key=rec.feature_breakdown.__getitem__, reverse=True
+        )[:2]
+
+        recs_out.append({
+            "model_id": rec.model_id,
+            "rank": rec.rank,
+            "score": rec.score,
+            "explanation": expl,
+            "explanation_source": expl_source,
+            "feature_breakdown": rec.feature_breakdown,
+            "top_features": top_features,
+        })
+
+    return JSONResponse({
+        "recommendations": recs_out,
+        "context_used": {
+            "primary_use": primary_use,
+            "scan_size_bucket": scan_size_bucket,
+            "dominant_recent_action": summary.get("dominant_action"),
+            "history_event_count": summary.get("total_events", 0),
+        },
+    })
+
+
 async def _ollama_status_endpoint(request: Request) -> JSONResponse:
     """GET /api/ollama/status?base_url=..."""
     base_url = request.query_params.get("base_url", "http://localhost:11434")
@@ -1369,6 +1433,9 @@ def create_app():
     )
     base_app.router.routes.append(
         Route("/api/usage/summary", _usage_summary_endpoint, methods=["GET"])
+    )
+    base_app.router.routes.append(
+        Route("/api/ollama/recommend", _ollama_recommend_endpoint, methods=["POST"])
     )
     base_app.router.routes.append(
         Route("/api/ollama/status", _ollama_status_endpoint, methods=["GET"])
