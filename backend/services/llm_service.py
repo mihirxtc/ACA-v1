@@ -4,7 +4,11 @@ import os
 import httpx
 from dotenv import load_dotenv
 
+from ollama_catalog import CLOUD_MODELS, DEFAULT_MODEL
+
 load_dotenv()
+
+_CLOUD_MODEL_IDS = {m["id"] for m in CLOUD_MODELS}
 
 
 async def chat_with_groq(
@@ -109,7 +113,7 @@ async def chat_with_ollama(
     scan_data: dict,
     history: list = None,
     api_key: str = None,
-    model_name: str = "llama3.2:3b",
+    model_name: str = DEFAULT_MODEL,
 ) -> str:
     """
     Send a message to a locally running Ollama instance.
@@ -134,8 +138,14 @@ async def chat_with_ollama(
 
     Setup required (one-time):
         ollama serve                  ← start the Ollama daemon
-        ollama pull llama3.2:3b             ← download the default model
+        ollama pull gpt-oss:20b-cloud ← download the default model
     """
+
+    if model_name not in _CLOUD_MODEL_IDS:
+        raise ValueError(
+            f"model_name {model_name!r} is not in the Ollama cloud catalog. "
+            f"Valid IDs: {sorted(_CLOUD_MODEL_IDS)}"
+        )
 
     if history is None:
         history = []

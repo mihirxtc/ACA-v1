@@ -56,6 +56,7 @@ from services.llm_service import (
     chat_with_ollama,
     prompt_llm,
 )
+from ollama_catalog import CLOUD_MODELS, DEFAULT_MODEL
 from services.ollama_service import probe_ollama, stream_ollama_pull
 from services.security_analyzer import run_security_analysis
 from services.terraform_service import (
@@ -1200,7 +1201,10 @@ async def ollama_status(base_url: str = "http://localhost:11434") -> dict:
         base_url: Ollama server URL. Defaults to "http://localhost:11434".
 
     Returns:
-        {"reachable", "base_url", "version", "models": [{"name","size_gb","modified_at"}], "error"}
+        {"state": "ready"|"no_models"|"unavailable", "base_url", "version",
+         "installed_models": [{"id","label","description"}],
+         "available_models": [{"id","label","description"}],
+         "error_code": str|null}
     """
     return await probe_ollama(base_url)
 
@@ -1263,11 +1267,21 @@ async def _ollama_status_endpoint(request: Request) -> JSONResponse:
     return JSONResponse(await probe_ollama(base_url))
 
 
-async def _ollama_pull_endpoint(request: Request) -> StreamingResponse:
-    """POST /api/ollama/pull — streams JSONL pull progress from Ollama."""
+_PULL_CATALOG_IDS = {m["id"] for m in CLOUD_MODELS}
+
+
+async def _ollama_pull_endpoint(request: Request):
+    """POST /api/ollama/pull — streams JSONL pull progress from Ollama.
+
+    Returns 400 immediately if the requested model is not in the cloud catalog.
+    """
     body = await request.json()
     model = body.get("model", "")
     base_url = body.get("base_url", "http://localhost:11434")
+
+    if model not in _PULL_CATALOG_IDS:
+        return JSONResponse({"error": "model_not_in_catalog"}, status_code=400)
+
     return StreamingResponse(
         stream_ollama_pull(base_url, model),
         media_type="application/x-ndjson",
