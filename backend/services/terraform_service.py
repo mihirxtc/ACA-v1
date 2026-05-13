@@ -256,7 +256,8 @@ async def generate_terraform_with_anthropic(request: str, api_key: str, existing
         user_content += f"\n\nEXISTING_INFRA:\n{existing_infra}"
 
     response = client.messages.create(
-        model="claude-haiku-20240307",
+        model="claude-haiku-4-5-20251001",
+        # model="claude-haiku-20240307",
         max_tokens=2048,
         system=SYSTEM_PROMPT,
         tools=[TERRAFORM_TOOL],

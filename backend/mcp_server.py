@@ -4,6 +4,8 @@
 # The React frontend calls the same endpoint via a thin JSON-RPC client.
 # The old Tool Use API (TOOLS list, dispatch_tool, agent loop) is gone.
 
+# we have defined function here
+
 import asyncio
 import json
 import os
