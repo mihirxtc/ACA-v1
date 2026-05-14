@@ -12,9 +12,9 @@ This file contains zero business logic.
 """
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 
 load_dotenv()
 
@@ -127,6 +127,82 @@ async def upload_rag_document(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+from usage_log import usage_summary as _usage_summary
+from services.ollama_service import probe_ollama, stream_ollama_pull
+from ollama_recommender import RecommendContext, llm_explanation, recommend
+from ollama_catalog import CLOUD_MODELS
+from mcp_server import _PULL_CATALOG_IDS
+
+@app.get("/api/usage/summary", tags=["Usage"])
+async def api_usage_summary(window_hours: int = Query(24)):
+    return _usage_summary(window_hours=window_hours)
+
+
+@app.get("/api/ollama/status", tags=["Ollama"])
+async def api_ollama_status(base_url: str = Query("http://localhost:11434")):
+    return await probe_ollama(base_url)
+
+
+@app.post("/api/ollama/pull", tags=["Ollama"])
+async def api_ollama_pull(request: Request):
+    body = await request.json()
+    model = body.get("model", "")
+    base_url = body.get("base_url", "http://localhost:11434")
+    if model not in _PULL_CATALOG_IDS:
+        raise HTTPException(status_code=400, detail="model_not_in_catalog")
+    return StreamingResponse(stream_ollama_pull(base_url, model), media_type="application/x-ndjson")
+
+
+@app.post("/api/ollama/recommend", tags=["Ollama"])
+async def api_ollama_recommend(request: Request):
+    import asyncio
+    body = await request.json()
+    primary_use    = body.get("primary_use", "chat")
+    latency_pref   = body.get("latency_pref", "balanced")
+    scan_size      = body.get("current_scan_size_bucket", "none")
+    anthropic_key  = body.get("anthropic_key") or None
+    groq_key       = body.get("groq_key") or None
+
+    summary = _usage_summary()
+    context = RecommendContext(
+        primary_use=primary_use,
+        latency_pref=latency_pref,
+        scan_size_bucket=scan_size,
+        dominant_recent_action=summary.get("dominant_action"),
+        history_event_count=summary.get("total_events", 0),
+    )
+    catalog_ids = [m["id"] for m in CLOUD_MODELS]
+    ranked = recommend(context, catalog_ids)
+
+    explanations = await asyncio.gather(
+        *[llm_explanation(r, context, anthropic_key, groq_key) for r in ranked],
+        return_exceptions=True,
+    )
+
+    recs_out = []
+    for rec, expl in zip(ranked, explanations):
+        if isinstance(expl, Exception):
+            expl = rec.template_explanation
+            expl_source = "template"
+        else:
+            expl_source = "llm" if (anthropic_key or groq_key) else "template"
+        top_features = sorted(rec.feature_breakdown, key=rec.feature_breakdown.__getitem__, reverse=True)[:2]
+        recs_out.append({
+            "model_id": rec.model_id, "rank": rec.rank, "score": rec.score,
+            "explanation": expl, "explanation_source": expl_source,
+            "feature_breakdown": rec.feature_breakdown, "top_features": top_features,
+        })
+
+    return {
+        "recommendations": recs_out,
+        "context_used": {
+            "primary_use": primary_use, "scan_size_bucket": scan_size,
+            "dominant_recent_action": summary.get("dominant_action"),
+            "history_event_count": summary.get("total_events", 0),
+        },
+    }
 
 
 if __name__ == "__main__":

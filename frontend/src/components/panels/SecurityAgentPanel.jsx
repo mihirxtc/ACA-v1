@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { callTool } from '../../api/mcpClient'
+import { logEvent } from '../../lib/usageLog'
 import { AGENT_STEPS } from '../../utils/constants'
 
 function PhasePill({ phase }) {
@@ -37,7 +38,7 @@ function AgentPhaseSteps({ step, done = false }) {
   )
 }
 
-export default function SecurityAgentPanel({ region, model, apiKey, awsAccessKey, awsSecretKey, onApplyComplete }) {
+export default function SecurityAgentPanel({ region, model, apiKey, ollamaModelName, awsAccessKey, awsSecretKey, onApplyComplete }) {
   const [phase,        setPhase]        = useState('idle')
   const [step,         setStep]         = useState(0)
   const [data,         setData]         = useState(null)
@@ -64,7 +65,9 @@ export default function SecurityAgentPanel({ region, model, apiKey, awsAccessKey
         region, model, api_key: apiKey,
         aws_access_key_id:     awsAccessKey || '',
         aws_secret_access_key: awsSecretKey || '',
+        ...(ollamaModelName ? { ollama_model_name: ollamaModelName } : {}),
       })
+      logEvent('agent_run', model, null)
       setData(r)
       setPhase(r.status === 'awaiting_approval' ? 'awaiting_approval' : 'idle')
     } catch (e) { setError(String(e)); setPhase('failed') }

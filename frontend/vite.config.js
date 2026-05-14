@@ -6,6 +6,7 @@ export default defineConfig({
   server: {
     proxy: {
       '/mcp':       'http://localhost:8000',
+      '/api':       'http://localhost:8000',
       '/terraform': 'http://localhost:8000',
       '/rag':       'http://localhost:8000',
       '/tools':     'http://localhost:8000',

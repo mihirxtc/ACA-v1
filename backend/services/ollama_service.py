@@ -1,4 +1,6 @@
 import json
+import os
+import pathlib
 
 import httpx
 
@@ -11,6 +13,27 @@ _CATALOG_ENTRIES = [
     {"id": m["id"], "label": m["label"], "description": m["description"]}
     for m in CLOUD_MODELS
 ]
+
+_OLLAMA_CREDENTIAL_PATHS = [
+    pathlib.Path.home() / ".ollama" / "id_ed25519",      # SSH key — written by `ollama signin`
+    pathlib.Path.home() / ".ollama" / "credentials",
+    pathlib.Path.home() / ".ollama" / "token",
+]
+
+
+def _ollama_signed_in() -> bool:
+    """Return True if an Ollama auth credential exists on disk.
+
+    `ollama signin` writes an SSH key pair to ~/.ollama/id_ed25519.
+    Its presence (non-empty) is the reliable signal the user is authenticated.
+    """
+    for path in _OLLAMA_CREDENTIAL_PATHS:
+        try:
+            if path.exists() and path.stat().st_size > 0:
+                return True
+        except OSError:
+            pass
+    return False
 
 
 async def probe_ollama(base_url: str = "http://localhost:11434") -> dict:
@@ -44,17 +67,26 @@ async def probe_ollama(base_url: str = "http://localhost:11434") -> dict:
             if tags_resp.status_code == 200:
                 for m in tags_resp.json().get("models", []):
                     name = m.get("name", "")
-                    if name in _CATALOG_IDS:
+                    if name:
                         installed_ids.add(name)
 
-        installed_models = [e for e in _CATALOG_ENTRIES if e["id"] in installed_ids]
+        _catalog_by_id = {e["id"]: e for e in _CATALOG_ENTRIES}
+        installed_models = []
+        for mid in installed_ids:
+            if mid in _catalog_by_id:
+                installed_models.append(_catalog_by_id[mid])
+            else:
+                installed_models.append({"id": mid, "label": mid, "description": "Locally installed model"})
+        installed_models.sort(key=lambda e: e["id"])
         available_models = [e for e in _CATALOG_ENTRIES if e["id"] not in installed_ids]
         state = "ready" if installed_models else "no_models"
 
+        signed_in = _ollama_signed_in()
         return {
             "state": state,
             "base_url": base_url,
             "version": version,
+            "signed_in": signed_in,
             "installed_models": installed_models,
             "available_models": available_models,
             "error_code": None,
@@ -64,6 +96,7 @@ async def probe_ollama(base_url: str = "http://localhost:11434") -> dict:
             "state": "unavailable",
             "base_url": base_url,
             "version": None,
+            "signed_in": _ollama_signed_in(),
             "installed_models": [],
             "available_models": list(_CATALOG_ENTRIES),
             "error_code": type(e).__name__,
@@ -73,6 +106,7 @@ async def probe_ollama(base_url: str = "http://localhost:11434") -> dict:
             "state": "unavailable",
             "base_url": base_url,
             "version": None,
+            "signed_in": _ollama_signed_in(),
             "installed_models": [],
             "available_models": list(_CATALOG_ENTRIES),
             "error_code": str(e),

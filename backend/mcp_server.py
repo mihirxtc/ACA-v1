@@ -59,6 +59,8 @@ from services.llm_service import (
     prompt_llm,
 )
 from ollama_catalog import CLOUD_MODELS, DEFAULT_MODEL
+from usage_log import log_event, usage_summary
+from ollama_recommender import RecommendContext, llm_explanation, recommend
 from services.ollama_service import probe_ollama, stream_ollama_pull
 from services.security_analyzer import run_security_analysis
 from services.terraform_service import (
@@ -308,6 +310,11 @@ async def run_security_analysis_with_summary(
     else:
         llm_summary = "No security issues found. Your AWS infrastructure looks clean."
 
+    try:
+        log_event("security_analysis", ollama_model_name if model == "ollama" else model, scan_data)
+    except Exception:
+        pass
+
     return {
         "findings": findings,
         "severity_counts": counts,
@@ -376,6 +383,11 @@ async def get_cost_with_summary(
     )
     llm_summary = await prompt_llm(summary_prompt, model, _resolve_key(model, api_key), model_name=ollama_model_name)
 
+    try:
+        log_event("cost_recommendation", ollama_model_name if model == "ollama" else model, None)
+    except Exception:
+        pass
+
     return {
         "current_month": current_month,
         "monthly_trend": monthly_trend,
@@ -428,6 +440,7 @@ async def generate_terraform_from_request(
     aws_access_key_id: str = "",
     aws_secret_access_key: str = "",
     aws_region: str = "us-east-1",
+    ollama_model_name: str = "gpt-oss:120b-cloud",
 ) -> dict:
     """Generate Terraform HCL from a plain-English request string.
 
@@ -465,13 +478,18 @@ async def generate_terraform_from_request(
         except Exception:
             existing_infra = ""
 
-    result = await generate_terraform(request, resolved_model, resolved_key, existing_infra)
+    result = await generate_terraform(request, resolved_model, resolved_key, existing_infra, ollama_model_name)
 
     naming_note = (
         "Resource names include a random suffix to prevent deployment conflicts."
         if result.get("hcl") and "random_id" in result.get("hcl", "")
         else None
     )
+
+    try:
+        log_event("terraform_generation", resolved_model, None)
+    except Exception:
+        pass
 
     return {
         "hcl": result.get("hcl", ""),
@@ -713,6 +731,11 @@ async def aws_chat(
         key = resolved_key or os.getenv("GROQ_API_KEY")
         reply = await chat_with_groq(message, scan_data, history, key)
 
+    try:
+        log_event("chat", ollama_model_name if model == "ollama" else model, scan_data)
+    except Exception:
+        pass
+
     return {"reply": reply}
 
 
@@ -783,7 +806,7 @@ async def agent_run(
     )
     resolved_key = _resolve_key(resolved_model, api_key)
 
-    terraform_result = await generate_terraform(fix_request, resolved_model, resolved_key)
+    terraform_result = await generate_terraform(fix_request, resolved_model, resolved_key, model_name=ollama_model_name)
     if terraform_result.get("error"):
         return {"status": "error", "error": terraform_result["error"]}
 
@@ -822,6 +845,11 @@ async def agent_run(
             "resources_to_destroy": plan_result.get("resources_to_destroy", 0),
         }
     )
+
+    try:
+        log_event("agent_run", ollama_model_name if resolved_model == "ollama" else resolved_model, scan_data)
+    except Exception:
+        pass
 
     return {
         "status": "awaiting_approval",
@@ -1263,6 +1291,78 @@ def aws_cost_summary_resource(region: str) -> dict:
 # HTTP endpoints (multipart upload + Ollama REST — not expressible as MCP tools)
 # =============================================================================
 
+async def _usage_summary_endpoint(request: Request) -> JSONResponse:
+    """GET /api/usage/summary?window_hours=24"""
+    try:
+        window_hours = int(request.query_params.get("window_hours", "24"))
+    except (ValueError, TypeError):
+        window_hours = 24
+    return JSONResponse(usage_summary(window_hours=window_hours))
+
+
+async def _ollama_recommend_endpoint(request: Request) -> JSONResponse:
+    """POST /api/ollama/recommend — ranked model recommendations with explanations."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+
+    primary_use = body.get("primary_use", "chat")
+    latency_pref = body.get("latency_pref", "balanced")
+    scan_size_bucket = body.get("current_scan_size_bucket", "none")
+    anthropic_key = body.get("anthropic_key") or None
+    groq_key = body.get("groq_key") or None
+
+    summary = usage_summary()
+    context = RecommendContext(
+        primary_use=primary_use,
+        latency_pref=latency_pref,
+        scan_size_bucket=scan_size_bucket,
+        dominant_recent_action=summary.get("dominant_action"),
+        history_event_count=summary.get("total_events", 0),
+    )
+
+    catalog_ids = [m["id"] for m in CLOUD_MODELS]
+    ranked = recommend(context, catalog_ids)
+
+    explanations = await asyncio.gather(
+        *[llm_explanation(r, context, anthropic_key, groq_key) for r in ranked],
+        return_exceptions=True,
+    )
+
+    recs_out = []
+    for rec, expl in zip(ranked, explanations):
+        if isinstance(expl, Exception):
+            expl = rec.template_explanation
+            expl_source = "template"
+        else:
+            expl_source = "llm" if (anthropic_key or groq_key) else "template"
+
+        top_features = sorted(
+            rec.feature_breakdown, key=rec.feature_breakdown.__getitem__, reverse=True
+        )[:2]
+
+        recs_out.append({
+            "model_id": rec.model_id,
+            "rank": rec.rank,
+            "score": rec.score,
+            "explanation": expl,
+            "explanation_source": expl_source,
+            "feature_breakdown": rec.feature_breakdown,
+            "top_features": top_features,
+        })
+
+    return JSONResponse({
+        "recommendations": recs_out,
+        "context_used": {
+            "primary_use": primary_use,
+            "scan_size_bucket": scan_size_bucket,
+            "dominant_recent_action": summary.get("dominant_action"),
+            "history_event_count": summary.get("total_events", 0),
+        },
+    })
+
+
 async def _ollama_status_endpoint(request: Request) -> JSONResponse:
     """GET /api/ollama/status?base_url=..."""
     base_url = request.query_params.get("base_url", "http://localhost:11434")
@@ -1328,17 +1428,20 @@ async def _upload_document_endpoint(request: Request) -> JSONResponse:
 def create_app():
     from starlette.routing import Route
 
-    base_app = create_streamable_http_app(mcp, streamable_http_path="/mcp")
+    # Pass extra routes at construction time — Starlette 0.52 compiles the
+    # router during __init__, so post-init .append() calls are silently ignored.
+    extra_routes = [
+        Route("/rag/documents/upload", _upload_document_endpoint, methods=["POST"]),
+        Route("/api/usage/summary",    _usage_summary_endpoint,   methods=["GET"]),
+        Route("/api/ollama/recommend", _ollama_recommend_endpoint, methods=["POST"]),
+        Route("/api/ollama/status",    _ollama_status_endpoint,   methods=["GET"]),
+        Route("/api/ollama/pull",      _ollama_pull_endpoint,     methods=["POST"]),
+    ]
 
-    # Append extra routes to the existing Starlette router
-    base_app.router.routes.append(
-        Route("/rag/documents/upload", _upload_document_endpoint, methods=["POST"])
-    )
-    base_app.router.routes.append(
-        Route("/api/ollama/status", _ollama_status_endpoint, methods=["GET"])
-    )
-    base_app.router.routes.append(
-        Route("/api/ollama/pull", _ollama_pull_endpoint, methods=["POST"])
+    base_app = create_streamable_http_app(
+        mcp,
+        streamable_http_path="/mcp",
+        routes=extra_routes,
     )
 
     base_app.add_middleware(

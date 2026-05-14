@@ -13,6 +13,7 @@ from filelock import FileLock
 _BACKEND_DIR = Path(__file__).parent.parent
 WORKDIR_BASE = _BACKEND_DIR / "terraform_workdirs"
 EXECUTION_LOG = _BACKEND_DIR / "execution_log.json"
+_TF_PLUGIN_CACHE = _BACKEND_DIR / ".terraform_plugin_cache"
 
 # File-level lock that serialises all read-modify-write operations on the log.
 # Two concurrent plan requests arriving at the same millisecond would otherwise
@@ -24,6 +25,11 @@ _LOG_LOCK = FileLock(str(EXECUTION_LOG) + ".lock", timeout=10)
 def _build_env(aws_creds: dict | None) -> dict:
     """Return an os.environ copy with AWS credentials injected if provided."""
     env = os.environ.copy()
+    # Persist downloaded providers across executions so terraform init never
+    # re-downloads on the second run (first run may be slow, but subsequent
+    # ones hit the cache and complete in seconds).
+    _TF_PLUGIN_CACHE.mkdir(parents=True, exist_ok=True)
+    env["TF_PLUGIN_CACHE_DIR"] = str(_TF_PLUGIN_CACHE)
     if aws_creds:
         if aws_creds.get("aws_access_key_id"):
             env["AWS_ACCESS_KEY_ID"] = aws_creds["aws_access_key_id"]
@@ -110,7 +116,7 @@ def run_terraform_plan(hcl_config: str, execution_id: str, aws_creds: dict | Non
             capture_output=True,
             text=True,
             cwd=workdir,
-            timeout=60,
+            timeout=180,
             env=env,
         )
 

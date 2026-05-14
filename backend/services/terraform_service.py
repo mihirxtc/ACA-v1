@@ -3,6 +3,7 @@ import os
 import re
 import subprocess
 import tempfile
+from pathlib import Path
 
 import anthropic
 import httpx
@@ -59,7 +60,7 @@ exactly as the Name tag value.
   name = "demo-sg-${random_id.suffix.hex}"    # suffix only on names that must be unique
 This prevents 400/409 "already exists" conflicts on every re-deploy.
 
-EC2 SSH KEY PAIR — when the request mentions SSH, port 22, or a key pair:
+EC2 SSH KEY PAIR — ALWAYS when creating any EC2 instance (even without SSH mention):
 ALWAYS generate a TLS key pair and save the private key locally using the tls provider:
 
   terraform {
@@ -95,7 +96,8 @@ ALWAYS generate a TLS key pair and save the private key locally using the tls pr
 Add "local" = { source = "hashicorp/local", version = "~> 2.0" } to required_providers
 when using local_file.
 
-NEW EC2 INSTANCE WITH SSH — when creating a fresh EC2 instance with a NEW security group:
+NEW EC2 INSTANCE — when creating a fresh EC2 instance with a NEW security group:
+  Include an SSH ingress rule (port 22) so the generated key pair is usable.
   Use a variable for the SSH CIDR with default "0.0.0.0/0" so the instance is reachable,
   AND always emit an output block reminding the user to lock it down:
 
@@ -193,6 +195,9 @@ When the user message contains an EXISTING_INFRA block, you MUST read it careful
 """
 
 
+_TF_PLUGIN_CACHE = Path(__file__).parent.parent / ".terraform_plugin_cache"
+
+
 def validate_terraform_syntax(hcl: str) -> dict:
     """
     Write HCL to a temporary directory and run:
@@ -202,6 +207,10 @@ def validate_terraform_syntax(hcl: str) -> dict:
     Returns {"valid": bool, "message": str}.
     The temp directory is automatically deleted afterwards.
     """
+    _TF_PLUGIN_CACHE.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env["TF_PLUGIN_CACHE_DIR"] = str(_TF_PLUGIN_CACHE)
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tf_path = os.path.join(tmpdir, "main.tf")
         with open(tf_path, "w") as f:
@@ -213,7 +222,8 @@ def validate_terraform_syntax(hcl: str) -> dict:
             cwd=tmpdir,
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=180,
+            env=env,
         )
         if init.returncode != 0:
             return {
@@ -228,6 +238,7 @@ def validate_terraform_syntax(hcl: str) -> dict:
             capture_output=True,
             text=True,
             timeout=30,
+            env=env,
         )
         if validate.returncode == 0:
             return {"valid": True, "message": "Terraform configuration is valid."}
@@ -333,7 +344,7 @@ Reply in this exact format — no other text:
     }
 
 
-async def generate_terraform_with_ollama(request: str, api_key: str, existing_infra: str = "") -> dict:
+async def generate_terraform_with_ollama(request: str, api_key: str, existing_infra: str = "", model_name: str = "gpt-oss:120b-cloud") -> dict:
     """
     Call a locally running Ollama instance to generate Terraform HCL.
 
@@ -366,11 +377,16 @@ Reply in this exact format — no other text:
         response = await client.post(
             f"{base_url}/api/chat",
             json={
-                "model": "gpt-oss:120b-cloud",
+                "model": model_name,
                 "messages": [{"role": "user", "content": prompt}],
                 "stream": False,
             },
         )
+        if response.status_code == 403 or "subscription" in response.text.lower():
+            raise ValueError(
+                f"'{model_name}' requires an Ollama subscription. "
+                "Run `ollama signin` or pick a free local model."
+            )
         response.raise_for_status()
         raw = response.json()["message"]["content"]
 
@@ -387,7 +403,7 @@ Reply in this exact format — no other text:
     }
 
 
-async def generate_terraform(request: str, model: str, api_key: str, existing_infra: str = "") -> dict:
+async def generate_terraform(request: str, model: str, api_key: str, existing_infra: str = "", model_name: str = "gpt-oss:120b-cloud") -> dict:
     """
     Route to the correct provider, then validate the generated HCL.
 
@@ -405,28 +421,45 @@ async def generate_terraform(request: str, model: str, api_key: str, existing_in
 
     Never raises — all errors are captured and returned as structured JSON
     so the endpoint always returns HTTP 200.
+    Retries up to 3 times when the model returns empty HCL (common with Ollama
+    when the model fails to emit a fenced ```hcl block).
     """
-    try:
-        if model == "anthropic":
-            result = await generate_terraform_with_anthropic(request, api_key, existing_infra)
-        elif model == "ollama":
-            result = await generate_terraform_with_ollama(request, api_key, existing_infra)
-        else:
-            result = await generate_terraform_with_groq(request, api_key, existing_infra)
+    max_attempts = 3 if model == "ollama" else 2
+    last_result: dict = {}
 
-        validation = validate_terraform_syntax(result["hcl"])
-        result["validation"] = validation
-        result["error"] = None
-        return result
+    for attempt in range(max_attempts):
+        try:
+            if model == "anthropic":
+                result = await generate_terraform_with_anthropic(request, api_key, existing_infra)
+            elif model == "ollama":
+                result = await generate_terraform_with_ollama(request, api_key, existing_infra, model_name)
+            else:
+                result = await generate_terraform_with_groq(request, api_key, existing_infra)
 
-    except Exception as e:
-        return {
-            "hcl": "",
-            "resource_type": "unknown",
-            "description": "Generation failed.",
-            "validation": {"valid": False, "message": str(e)},
-            "error": str(e),
-        }
+            if result.get("hcl"):
+                validation = validate_terraform_syntax(result["hcl"])
+                result["validation"] = validation
+                result["error"] = None
+                return result
+
+            last_result = {
+                "hcl": "",
+                "resource_type": result.get("resource_type", "unknown"),
+                "description": result.get("description", "Empty HCL returned."),
+                "validation": {"valid": False, "message": "Model returned empty HCL."},
+                "error": "Model returned empty HCL.",
+            }
+
+        except Exception as e:
+            last_result = {
+                "hcl": "",
+                "resource_type": "unknown",
+                "description": "Generation failed.",
+                "validation": {"valid": False, "message": str(e)},
+                "error": str(e),
+            }
+
+    return last_result
 
 
 def handle_summarise_plan(
