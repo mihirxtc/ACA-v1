@@ -4,7 +4,11 @@ import os
 import httpx
 from dotenv import load_dotenv
 
+from ollama_catalog import CLOUD_MODELS, DEFAULT_MODEL
+
 load_dotenv()
+
+_CLOUD_MODEL_IDS = {m["id"] for m in CLOUD_MODELS}
 
 
 async def chat_with_groq(
@@ -105,10 +109,14 @@ async def chat_with_groq(
 
 
 async def chat_with_ollama(
-    message: str, scan_data: dict, history: list = None, api_key: str = None
+    message: str,
+    scan_data: dict,
+    history: list = None,
+    api_key: str = None,
+    model_name: str = DEFAULT_MODEL,
 ) -> str:
     """
-    Send a message to a locally running Ollama instance using minimax-m2.7:cloud.
+    Send a message to a locally running Ollama instance.
 
     Ollama runs entirely on the user's own machine — no data leaves the
     network and no API key is required. This makes it the private/offline
@@ -130,8 +138,14 @@ async def chat_with_ollama(
 
     Setup required (one-time):
         ollama serve                  ← start the Ollama daemon
-        ollama pull minimax-m2.7:cloud      ← download the model (~4 GB)
+        ollama pull gpt-oss:20b-cloud ← download the default model
     """
+
+    if model_name not in _CLOUD_MODEL_IDS:
+        raise ValueError(
+            f"model_name {model_name!r} is not in the Ollama cloud catalog. "
+            f"Valid IDs: {sorted(_CLOUD_MODEL_IDS)}"
+        )
 
     if history is None:
         history = []
@@ -255,7 +269,7 @@ async def chat_with_ollama(
             response = await client.post(
                 f"{base_url}/api/chat",
                 json={
-                    "model": "gpt-oss:120b-cloud",
+                    "model": model_name,
                     "messages": messages,
                     "stream": False,
                 },
@@ -270,9 +284,9 @@ async def chat_with_ollama(
 
     except httpx.ConnectError:
         return (
-            "Cannot connect to Ollama. Make sure Ollama is running "
-            "(run: ollama serve) and minimax-m2.7:cloud is installed "
-            "(run: ollama pull minimax-m2.7:cloud)"
+            f"Cannot connect to Ollama. Make sure Ollama is running "
+            f"(run: ollama serve) and {model_name} is installed "
+            f"(run: ollama pull {model_name})"
         )
 
     except httpx.ReadTimeout:
@@ -285,7 +299,12 @@ async def chat_with_ollama(
         return f"Ollama error: {type(e).__name__}: {str(e)}"
 
 
-async def prompt_llm(prompt: str, model: str = "groq", api_key: str = "") -> str:
+async def prompt_llm(
+    prompt: str,
+    model: str = "groq",
+    api_key: str = "",
+    model_name: str = "llama3.2:3b",
+) -> str:
     """
     Send a single plain-text prompt to the configured LLM provider.
 
@@ -337,7 +356,7 @@ async def prompt_llm(prompt: str, model: str = "groq", api_key: str = "") -> str
                 resp = await client.post(
                     f"{base_url}/api/chat",
                     json={
-                        "model": "gpt-oss:120b-cloud",
+                        "model": model_name,
                         "messages": [{"role": "user", "content": prompt}],
                         "stream": False,
                     },

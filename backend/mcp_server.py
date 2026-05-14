@@ -23,7 +23,8 @@ from fastmcp import FastMCP
 from fastmcp.server.http import create_streamable_http_app
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, StreamingResponse
+import httpx
 import uvicorn
 
 from services.aws_scanner import (
@@ -57,6 +58,8 @@ from services.llm_service import (
     chat_with_ollama,
     prompt_llm,
 )
+from ollama_catalog import CLOUD_MODELS, DEFAULT_MODEL
+from services.ollama_service import probe_ollama, stream_ollama_pull
 from services.security_analyzer import run_security_analysis
 from services.terraform_service import (
     generate_terraform,
@@ -77,6 +80,8 @@ def _resolve_key(model: str, override: str) -> str:
         return key
     if model == "anthropic":
         return os.getenv("ANTHROPIC_API_KEY", "")
+    if model == "ollama":
+        return os.getenv("OLLAMA_BASE_URL", "")
     return os.getenv("GROQ_API_KEY", "")
 
 
@@ -252,6 +257,7 @@ async def run_security_analysis_with_summary(
     region: str = "us-east-1",
     model: str = "groq",
     api_key: str = "",
+    ollama_model_name: str = "llama3.2:3b",
 ) -> dict:
     """Scan AWS, run security rules, and generate an LLM plain-English summary.
 
@@ -298,7 +304,7 @@ async def run_security_analysis_with_summary(
                 indent=2,
             )
         )
-        llm_summary = await prompt_llm(summary_prompt, model, _resolve_key(model, api_key))
+        llm_summary = await prompt_llm(summary_prompt, model, _resolve_key(model, api_key), model_name=ollama_model_name)
     else:
         llm_summary = "No security issues found. Your AWS infrastructure looks clean."
 
@@ -337,6 +343,7 @@ async def get_cost_with_summary(
     region: str = "us-east-1",
     model: str = "groq",
     api_key: str = "",
+    ollama_model_name: str = "llama3.2:3b",
 ) -> dict:
     """Retrieve AWS cost data and generate an LLM cost-optimisation summary.
 
@@ -367,7 +374,7 @@ async def get_cost_with_summary(
         "provide 3-4 actionable recommendations in plain English:\n\n"
         + json.dumps(cost_summary, indent=2, default=str)
     )
-    llm_summary = await prompt_llm(summary_prompt, model, _resolve_key(model, api_key))
+    llm_summary = await prompt_llm(summary_prompt, model, _resolve_key(model, api_key), model_name=ollama_model_name)
 
     return {
         "current_month": current_month,
@@ -663,6 +670,7 @@ async def aws_chat(
     api_key: str = "",
     history: list = None,
     region: str = "us-east-1",
+    ollama_model_name: str = "llama3.2:3b",
 ) -> dict:
     """Chat with an LLM about your live AWS infrastructure.
 
@@ -700,7 +708,7 @@ async def aws_chat(
         key = resolved_key or os.getenv("ANTHROPIC_API_KEY")
         reply = await chat_with_anthropic(message, scan_data, history, key)
     elif model == "ollama":
-        reply = await chat_with_ollama(message, scan_data, history)
+        reply = await chat_with_ollama(message, scan_data, history, api_key=resolved_key, model_name=ollama_model_name)
     else:
         key = resolved_key or os.getenv("GROQ_API_KEY")
         reply = await chat_with_groq(message, scan_data, history, key)
@@ -715,6 +723,7 @@ async def agent_run(
     api_key: str = "",
     aws_access_key_id: str = "",
     aws_secret_access_key: str = "",
+    ollama_model_name: str = "llama3.2:3b",
 ) -> dict:
     """Autonomous security remediation agent — scan, pick top issue, generate fix, plan.
 
@@ -796,7 +805,7 @@ async def agent_run(
         f"-{plan_result.get('resources_to_destroy',0)}\n\n"
         f"Plan:\n{plan_snippet}"
     )
-    summary = await prompt_llm(summary_prompt, resolved_model, resolved_key)
+    summary = await prompt_llm(summary_prompt, resolved_model, resolved_key, model_name=ollama_model_name)
 
     # Log to execution history
     log_execution(
@@ -1182,7 +1191,28 @@ def rag_upload_file(
 
 
 # =============================================================================
-# GROUP F — MCP Resources (pulled on demand, not injected into every prompt)
+# GROUP F — Ollama Detection
+# =============================================================================
+
+
+@mcp.tool()
+async def ollama_status(base_url: str = "http://localhost:11434") -> dict:
+    """Probe a local Ollama instance and list installed models.
+
+    Args:
+        base_url: Ollama server URL. Defaults to "http://localhost:11434".
+
+    Returns:
+        {"state": "ready"|"no_models"|"unavailable", "base_url", "version",
+         "installed_models": [{"id","label","description"}],
+         "available_models": [{"id","label","description"}],
+         "error_code": str|null}
+    """
+    return await probe_ollama(base_url)
+
+
+# =============================================================================
+# GROUP G — MCP Resources (pulled on demand, not injected into every prompt)
 # =============================================================================
 
 
@@ -1230,8 +1260,35 @@ def aws_cost_summary_resource(region: str) -> dict:
 
 
 # =============================================================================
-# HTTP file-upload endpoint (multipart — cannot be an MCP tool parameter)
+# HTTP endpoints (multipart upload + Ollama REST — not expressible as MCP tools)
 # =============================================================================
+
+async def _ollama_status_endpoint(request: Request) -> JSONResponse:
+    """GET /api/ollama/status?base_url=..."""
+    base_url = request.query_params.get("base_url", "http://localhost:11434")
+    return JSONResponse(await probe_ollama(base_url))
+
+
+_PULL_CATALOG_IDS = {m["id"] for m in CLOUD_MODELS}
+
+
+async def _ollama_pull_endpoint(request: Request):
+    """POST /api/ollama/pull — streams JSONL pull progress from Ollama.
+
+    Returns 400 immediately if the requested model is not in the cloud catalog.
+    """
+    body = await request.json()
+    model = body.get("model", "")
+    base_url = body.get("base_url", "http://localhost:11434")
+
+    if model not in _PULL_CATALOG_IDS:
+        return JSONResponse({"error": "model_not_in_catalog"}, status_code=400)
+
+    return StreamingResponse(
+        stream_ollama_pull(base_url, model),
+        media_type="application/x-ndjson",
+    )
+
 
 async def _upload_document_endpoint(request: Request) -> JSONResponse:
     """POST /rag/documents/upload — multipart file upload to ChromaDB."""
@@ -1273,13 +1330,15 @@ def create_app():
 
     base_app = create_streamable_http_app(mcp, streamable_http_path="/mcp")
 
-    # Append the file-upload route to the existing Starlette router
+    # Append extra routes to the existing Starlette router
     base_app.router.routes.append(
-        Route(
-            "/rag/documents/upload",
-            _upload_document_endpoint,
-            methods=["POST"],
-        )
+        Route("/rag/documents/upload", _upload_document_endpoint, methods=["POST"])
+    )
+    base_app.router.routes.append(
+        Route("/api/ollama/status", _ollama_status_endpoint, methods=["GET"])
+    )
+    base_app.router.routes.append(
+        Route("/api/ollama/pull", _ollama_pull_endpoint, methods=["POST"])
     )
 
     base_app.add_middleware(
