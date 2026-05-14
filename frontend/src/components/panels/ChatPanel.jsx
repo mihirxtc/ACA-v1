@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import { callTool } from '../../api/mcpClient'
 import { logEvent } from '../../lib/usageLog'
 
-export default function ChatPanel({ model, apiKey }) {
+export default function ChatPanel({ model, apiKey, ollamaModelName }) {
   const [messages, setMessages] = useState([])
   const [input,    setInput]    = useState('')
   const [loading,  setLoading]  = useState(false)
@@ -21,7 +21,10 @@ export default function ChatPanel({ model, apiKey }) {
     setLoading(true)
     try {
       const history = [...messages, newMsg].map((m) => ({ role: m.role, content: m.content }))
-      const r = await callTool('aws_chat', { message: msg, model, api_key: apiKey, history })
+      const r = await callTool('aws_chat', {
+        message: msg, model, api_key: apiKey, history,
+        ...(ollamaModelName ? { ollama_model_name: ollamaModelName } : {}),
+      })
       logEvent('chat', model, null)
       setMessages((m) => [...m, { role: 'assistant', content: r.reply }])
     } finally { setLoading(false) }

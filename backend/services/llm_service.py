@@ -141,12 +141,6 @@ async def chat_with_ollama(
         ollama pull gpt-oss:20b-cloud ← download the default model
     """
 
-    if model_name not in _CLOUD_MODEL_IDS:
-        raise ValueError(
-            f"model_name {model_name!r} is not in the Ollama cloud catalog. "
-            f"Valid IDs: {sorted(_CLOUD_MODEL_IDS)}"
-        )
-
     if history is None:
         history = []
 
@@ -276,7 +270,12 @@ async def chat_with_ollama(
             )
 
             if response.status_code != 200:
-                return f"Ollama API error ({response.status_code}): {response.text}"
+                if response.status_code == 403 or "subscription" in response.text.lower():
+                    return (
+                        f"'{model_name}' requires an Ollama subscription. "
+                        "Run `ollama signin` or pick a free local model."
+                    )
+                return f"Ollama error ({response.status_code}) — make sure Ollama is running and the model is installed."
 
             data = response.json()
 
@@ -362,7 +361,12 @@ async def prompt_llm(
                     },
                 )
                 if resp.status_code != 200:
-                    return f"Ollama error ({resp.status_code}): {resp.text}"
+                    if resp.status_code == 403 or "subscription" in resp.text.lower():
+                        return (
+                            f"'{model_name}' requires an Ollama subscription. "
+                            "Run `ollama signin` or pick a free local model."
+                        )
+                    return f"Ollama error ({resp.status_code}) — make sure Ollama is running and the model is installed."
                 return resp.json()["message"]["content"]
         except httpx.ConnectError:
             return "Cannot connect to Ollama. Make sure Ollama is running (run: ollama serve)."

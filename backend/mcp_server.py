@@ -438,6 +438,7 @@ async def generate_terraform_from_request(
     aws_access_key_id: str = "",
     aws_secret_access_key: str = "",
     aws_region: str = "us-east-1",
+    ollama_model_name: str = "gpt-oss:120b-cloud",
 ) -> dict:
     """Generate Terraform HCL from a plain-English request string.
 
@@ -475,7 +476,7 @@ async def generate_terraform_from_request(
         except Exception:
             existing_infra = ""
 
-    result = await generate_terraform(request, resolved_model, resolved_key, existing_infra)
+    result = await generate_terraform(request, resolved_model, resolved_key, existing_infra, ollama_model_name)
 
     naming_note = (
         "Resource names include a random suffix to prevent deployment conflicts."
@@ -803,7 +804,7 @@ async def agent_run(
     )
     resolved_key = _resolve_key(resolved_model, api_key)
 
-    terraform_result = await generate_terraform(fix_request, resolved_model, resolved_key)
+    terraform_result = await generate_terraform(fix_request, resolved_model, resolved_key, model_name=ollama_model_name)
     if terraform_result.get("error"):
         return {"status": "error", "error": terraform_result["error"]}
 
@@ -1425,23 +1426,20 @@ async def _upload_document_endpoint(request: Request) -> JSONResponse:
 def create_app():
     from starlette.routing import Route
 
-    base_app = create_streamable_http_app(mcp, streamable_http_path="/mcp")
+    # Pass extra routes at construction time — Starlette 0.52 compiles the
+    # router during __init__, so post-init .append() calls are silently ignored.
+    extra_routes = [
+        Route("/rag/documents/upload", _upload_document_endpoint, methods=["POST"]),
+        Route("/api/usage/summary",    _usage_summary_endpoint,   methods=["GET"]),
+        Route("/api/ollama/recommend", _ollama_recommend_endpoint, methods=["POST"]),
+        Route("/api/ollama/status",    _ollama_status_endpoint,   methods=["GET"]),
+        Route("/api/ollama/pull",      _ollama_pull_endpoint,     methods=["POST"]),
+    ]
 
-    # Append extra routes to the existing Starlette router
-    base_app.router.routes.append(
-        Route("/rag/documents/upload", _upload_document_endpoint, methods=["POST"])
-    )
-    base_app.router.routes.append(
-        Route("/api/usage/summary", _usage_summary_endpoint, methods=["GET"])
-    )
-    base_app.router.routes.append(
-        Route("/api/ollama/recommend", _ollama_recommend_endpoint, methods=["POST"])
-    )
-    base_app.router.routes.append(
-        Route("/api/ollama/status", _ollama_status_endpoint, methods=["GET"])
-    )
-    base_app.router.routes.append(
-        Route("/api/ollama/pull", _ollama_pull_endpoint, methods=["POST"])
+    base_app = create_streamable_http_app(
+        mcp,
+        streamable_http_path="/mcp",
+        routes=extra_routes,
     )
 
     base_app.add_middleware(

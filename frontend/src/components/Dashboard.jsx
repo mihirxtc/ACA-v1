@@ -58,12 +58,15 @@ export default function Dashboard({ onOpenSettings }) {
     return () => clearInterval(id)
   }, [infra, runInfra])
 
+  const ollamaModelName = keys.ollama_model || undefined
+
   const runSecurity = async () => {
     setSecurityLoading(true)
     try {
       const d = await callTool('run_security_analysis_with_summary', {
-        model:   keys.model,
-        api_key: getApiKey(),
+        model:              keys.model,
+        api_key:            getApiKey(),
+        ...(ollamaModelName ? { ollama_model_name: ollamaModelName } : {}),
       })
       logEvent('security_analysis', keys.model, infra)
       setSecurity(d)
@@ -77,6 +80,7 @@ export default function Dashboard({ onOpenSettings }) {
       const costData = await callTool('get_cost_with_summary', {
         model:   keys.model,
         api_key: getApiKey(),
+        ...(ollamaModelName ? { ollama_model_name: ollamaModelName } : {}),
       })
       logEvent('cost_recommendation', keys.model, null)
       setCost(costData)
@@ -132,9 +136,10 @@ export default function Dashboard({ onOpenSettings }) {
         />
         <SecurityPanel data={security} loading={securityLoading} onScan={runSecurity} onFix={onFix} onDirectFix={onDirectFix} />
         <CostPanel data={cost} loading={costLoading} onLoad={runCost} />
-        <ChatPanel model={keys.model || 'groq'} apiKey={getApiKey()} />
+        <ChatPanel model={keys.model || 'groq'} apiKey={getApiKey()} ollamaModelName={ollamaModelName} />
         <TerraformPanel
           model={keys.model || 'groq'} apiKey={getApiKey()}
+          ollamaModelName={ollamaModelName}
           awsAccessKey={keys.aws_access_key} awsSecretKey={keys.aws_secret_key}
           awsRegion={keys.region || 'us-east-1'}
           prefill={prefill} onPrefillConsumed={() => setPrefill(null)}
@@ -145,6 +150,7 @@ export default function Dashboard({ onOpenSettings }) {
           region={keys.region || 'us-east-1'}
           model={keys.model || 'groq'}
           apiKey={getApiKey()}
+          ollamaModelName={ollamaModelName}
           awsAccessKey={keys.aws_access_key}
           awsSecretKey={keys.aws_secret_key}
           onApplyComplete={onInfraChanged}

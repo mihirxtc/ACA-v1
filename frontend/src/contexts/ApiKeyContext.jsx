@@ -2,6 +2,7 @@ import { createContext, useContext, useState, useEffect } from 'react'
 
 export const DEFAULT_KEYS = {
   model:          'groq',
+  ollama_model:   '',        // specific installed model, e.g. "gpt-oss:120b-cloud"
   region:         'us-east-1',
   groq_key:       '',
   anthropic_key:  '',

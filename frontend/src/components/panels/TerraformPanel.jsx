@@ -253,7 +253,7 @@ function ExecutionInline({ hcl, description, awsAccessKey, awsSecretKey, awsRegi
   )
 }
 
-export default function TerraformPanel({ model, apiKey, awsAccessKey, awsSecretKey, awsRegion, prefill, onPrefillConsumed, onApplyComplete, }) {
+export default function TerraformPanel({ model, apiKey, ollamaModelName, awsAccessKey, awsSecretKey, awsRegion, prefill, onPrefillConsumed, onApplyComplete, }) {
   const [input,    setInput]    = useState('')
   const [loading,  setLoading]  = useState(false)
   const [result,   setResult]   = useState(null)
@@ -281,6 +281,7 @@ export default function TerraformPanel({ model, apiKey, awsAccessKey, awsSecretK
         request,
         model,
         api_key: apiKey,
+        ...(ollamaModelName ? { ollama_model_name: ollamaModelName } : {}),
         aws_access_key_id:     awsAccessKey || '',
         aws_secret_access_key: awsSecretKey || '',
         aws_region:            awsRegion    || 'us-east-1',
